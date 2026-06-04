@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# opencode
+.opencode/
+
+# claude
+.claude/
+
+# codegraph
+.codegraph/
+
+# Models
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Output
+results/
+reports/
+
+# Logs
+log/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Ruff / mypy
+.ruff_cache/
+.mypy_cache/
