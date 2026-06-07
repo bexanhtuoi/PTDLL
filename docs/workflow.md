@@ -1,156 +1,153 @@
 # Luồng hoạt động
 
-> **End-to-end:** OHLCV 15 coins → Feature cube `(T, 15, 14)` → RL allocate → Stop-loss cứng → Daily close check → Sell on hit → USDT → RL re-allocate
+> **End-to-end:** OHLCV 15 coins → Feature cube → RL allocate → 3 risk models predict stop → Daily close check → Sell on hit → USDT → RL re-allocate
 
 ---
 
 ## 1. Luồng dữ liệu
 
-```mermaid
-graph TD
-    A[OHLCV 15 coins] --> B[build_feature_table]
-    B --> C[aligned_features → cube T×15×12]
-    C --> D[filter_by_date train/val/test]
-    D --> E[TRAIN: 2017→2024]
-    D --> F[VAL: 2024→2025]
-    D --> G[TEST: 2025→2026]
-
-    E --> H[CryptoPortfolioEnv]
-    F --> I[CryptoPortfolioEnv]
-    G --> J[CryptoPortfolioEnv]
-
-    H --> K[PPOAgent]
-    H --> L[SACAgent]
-    H --> M[TD3Agent]
-
-    K --> N[Val every 50 eps]
-    L --> N
-    M --> N
-
-    N --> O[Best Val Sharpe → save checkpoint]
-    O --> P[run_test on TEST env]
-    P --> Q[print_results comparison]
-
-    Q --> R[Stop-Loss Layer]
-    R --> S[ATR Baseline / XGBoost / Conv1D StopNet]
-    S --> T[Predict stop_% per coin]
-    T --> U[Set stop_price = close × (1 - stop_%)]
-    U --> V[Daily: close ≤ stop_price?]
-    V -->|Yes| W[Auto sell → USDT]
-    V -->|No| X[Hold]
-    W --> Y[USDT > 0 → RL re-allocate]
+```
+OHLCV 15 coins (BTC, ETH, ..., USDT)
+  │
+  ▼
+feature engineering: coin_fx(), cross_fx(), mkt_regime()
+  │
+  ▼
+stack_cube() → (T, 15, 14) feature_names, asset_names, date_index
+  │
+  ▼
+build_env() → CryptoPortfolioEnv(train/val/test)
+  │
+  ├── RL: state = env.get_state() → (60, 15, 14) bị normalize + weight channel
+  └── Risk: lấy (60, 13) per coin (13 market features, no weight)
 ```
 
----
+## 2. Training pipeline
 
-## 2. Episode lifecycle
+### Portfolio (RL)
 
 ```
-reset(seed)
-  ─ random 2-year window trong train set (730 days)
-  ─ state = cube[t-lookback : t]  →  (60, 15, 14)
-  ↓
-step(action_weights)
-  ─ clip(0,1) + normalize sum=1
-  ─ hold 90 days (~3 months, quarterly rebalance)
-  ─ portfolio_return = Σ(asset_returns × weights)
-  ─ reward = excess_return - 0.1×vol - 0.05×dd_90 - 0.001×turnover
-  ↓
-... repeat ~8 steps → done=True
-  ↓
-evaluate vs 4 benchmarks:
-  BTC hold, Equal-weight, Top momentum, Risk parity
+load_coin_arrays() → build_env(train) + build_env(val) + build_env(test)
+
+For each model (PPO → SAC → TD3):
+  make_agent(name, train_env, cfg)
+  agent.fit(train_env, val_env)      # n_episodes=1000+
+    └── each episode: 2 years, random start
+    └── val every 50 eps: score on val_env
+    └── early stop if no improvement for 20 val checks
+  agent.save("models/{name}.pt")
+  test = agent.score(test_env)
+  save_history(name, history, test, history_path)
 ```
 
----
+**Sequential**: train 3 model nối tiếp. **Parallel**: spawn process per model (multi-process, Windows safe).
 
-## 3. Training pipeline
+### Risk (ML)
 
-```python
-# models/train.py:run()
-def run():
-    coins = load_all_coins(symbols=COINS_15)
-    train_cube, _ = aligned_features(coins, "2017", "2024")
-    val_cube,   _ = aligned_features(coins, "2024", "2025")
-    test_cube,  _ = aligned_features(coins, "2025", "2026")
+```
+to_arrays() → cache tại data/processed/risk_data.npz (xs, idxs, targets, dates)
 
-    train_env = CryptoPortfolioEnv(train_cube, ...)
-    val_env   = CryptoPortfolioEnv(val_cube, ...)
-    test_env  = CryptoPortfolioEnv(test_cube, ...)
+build_data(cfg) → temporal split (train/val/test)
+  Train: dates < train_end - 90 ngày (label-safe)
+  Val:   dates in [val_start, test_start)
+  Test:  dates >= test_start
 
-    for name in ["ppo", "sac", "td3"]:
-        agent = create_agent(name, cfg)
-        agent = train_model(agent, train_env, val_env, n_episodes=5000)
-        agent.save(f"models/{name}.pt")
-        metrics = run_test(agent, test_env, n_test=50)
-        save_json(metrics, f"results/reports/rl_{name}_test_metrics.json")
-
-    print_results(all_metrics)
+For each model (ANN → LSTM → CNN):
+  model = StopANN/LSTM/CNN(emb=Embedding(14, 4))
+  train(model, train_loader, val_loader)
+  └── epochs=100, batch=256, Adam(lr=1e-3)
+  └── loss: asym_mae(over=0.5, under=2.0) + boundary_reg(alpha=0.001)
+  └── early stop patience=10
+  └── save best model → models/risk_{name}.pt
 ```
 
----
+## 3. Inference flow
 
-## 4. State cube (14 channels)
+```
+main.py predict
 
-Features từ `env.py:aligned_features()` + `compute_coin_features()`:
+  portfolio predict --model ppo
+    load_agent("ppo") + build_env()
+    agent.simulate(test_env) → weights history + PV
+    → PREDICTIONS_DIR/{model}_pv.csv, weight_{coin}.csv
 
-| Index | Feature | Source |
-|:-----:|---------|--------|
-| 0 | return_1d | Daily close return |
-| 1 | return_7d | 7-day rolling return |
-| 2 | return_30d | 30-day rolling return |
-| 3 | return_90d | 90-day rolling return |
-| 4 | volatility | 20-day rolling std(return_1d) |
-| 5 | drawdown | close / rolling_max(close) - 1 |
-| 6 | volume_change | (vol - vol_prev) / vol_prev, clipped [-5, 5] |
-| 7 | relative_strength_vs_BTC | return_30d[coin] - return_30d[BTC] |
-| 8 | correlation_vs_BTC | rolling_60d corr(return, BTC_return) |
-| 9 | btc_ma200_position | (BTC - SMA200) / SMA200 |
-| 10 | market_volatility | Mean volatility across all coins |
-| 11 | btc_momentum_90d | (BTC - BTC_90d_ago) / BTC_90d_ago |
-| 12 | market_breadth | Fraction of coins with return_30d > 0 |
-| 13 | weight | Injected by env (current allocation) |
+  risk predict --model cnn   (chưa implement CLI)
+    load model + data
+    For each coin: predict(x_60d, coin_idx) → stop_%
+    → PREDICTIONS_DIR/risk_predictions.csv
+```
 
----
+## 4. Report flow
 
-## 5. Action space
+```
+main.py report
+  │
+  ├── Portfolio report
+  │   load agents for all 3 models
+  │   sim_agent(agent, test_env) → PV
+  │   eval_metrics → latex table + JSON
+  │   plot: equity curves, training sharpes, vs BTC
+  │   → FIGURES_DIR/*.png, TABLES_DIR/*.tex
+  │
+  └── Risk report
+      load 3 risk models
+      evaluate: MAE, hit_rate, false_positive, saved_drawdown
+      → FIGURES_DIR/risk_*.png, TABLES_DIR/risk_*.tex
+```
+
+## 5. Actions space (RL)
 
 **Dirichlet distribution** (PPO, SAC) hoặc **softmax** (TD3):
 
-```
-α = softmax(logits) × 10 + 1          # concentration params
-action ~ Dirichlet(α)                  # sample continuous weights (PPO/SAC)
-action = softmax(logits)                # deterministic (TD3)
-Σ(action) = 1, 0 ≤ actionᵢ ≤ 1         # valid allocation
-```
+- `α = softmax(logits) × 10 + 1` — concentration params
+- `action ~ Dirichlet(α)` — sample (PPO/SAC)
+- `action = softmax(logits)` — deterministic (TD3)
+- `Σ(action) = 1`, `0 ≤ actionᵢ ≤ 1`
 
----
-
-## 6. Network architecture
+## 6. Network architecture (RL)
 
 ```
 Input: (batch, L=60, A=15, F=14)
-           ↓ reshape
+    ↓ reshape
 (batch, channels=210, length=60)
-           ↓
+    ↓
 Conv1d(210→64, kernel=5, padding=2) + ReLU
-           ↓
+    ↓
 AdaptiveAvgPool1d(1) → flatten → (batch, 64)
-           ↓
+    ↓
 FC(64→128) → ReLU → FC(128→64) → FC(64→n_assets=15)
-           ↓
+    ↓
 Dirichlet / softmax → allocation weights
 ```
 
-> StopNet reuses StateEncoder: Input (state, weights) → StateEncoder → concat(32, weights) → FC → Sigmoid → scale [0.05, 0.50]
+## 7. Network architecture (Risk)
 
----
+Cả 3 đều kế thừa `BaseStopModel(ABC)` + `Embedding(14, 4)` cho coin_id:
 
-## 7. Tests (11 tests)
+### ANN
+```
+Input: (60, 13) → flatten → Linear(780→64) → Dropout(0.3) → concat emb(4)
+→ Linear(68→32) → Linear(32→1) → Sigmoid × 0.45 + 0.05 → stop_%
+```
 
-| File | Tests |
-|------|:-----:|
-| `tests/test_rl.py` | 10 (env ×2, agent weights, 3 agents × train+run, filter) |
-| `tests/test_indicators.py` | 1 (RSI bounds) |
+### LSTM
+```
+Input: (60, 13) → concat tile emb(60, 4) → LSTM(17→64) → h_n[-1]
+→ Linear(64→1) → Sigmoid × 0.45 + 0.05 → stop_%
+```
+
+### CNN
+```
+Input: (60, 13) → Conv1d(13→32, k3) → BN → ReLU → Pool
+→ Conv1d(32→64, k3) → BN → ReLU → Pool → flatten → concat emb(4)
+→ Linear(...→64) → Linear(64→1) → Sigmoid × 0.45 + 0.05 → stop_%
+```
+
+## 8. Tests (11 tests)
+
+| File | Tests | Nội dung |
+|------|:-----:|----------|
+| `tests/test_rl.py` | 10 | env reset/step, agent weights, PPO/SAC/TD3 train+run, filter |
+| `tests/test_indicators.py` | 1 | RSI bounds |
 
 All pass, ~7s.

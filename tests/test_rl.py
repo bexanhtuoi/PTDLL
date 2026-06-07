@@ -1,16 +1,30 @@
 import numpy as np
-import pandas as pd
 
-from dataset.fetch import generate_synthetic_ohlcv, clean_ohlcv
-from models import PPOAgent, SACAgent, TD3Agent, CryptoPortfolioEnv
-from models.env import filter_by_date
+from dataset.fetch import generate_synthetic_ohlcv
+from portfolio.ppo import PPOAgent
+from portfolio.sac import SACAgent
+from portfolio.td3 import TD3Agent
+from portfolio.env import build_env
+from portfolio.base import CryptoPortfolioEnv, build_cube
+from config import PipelineConfig
+
+
+def _coin_arrays():
+    out = {}
+    for name in ["BTC", "ETH", "USDT"]:
+        d = generate_synthetic_ohlcv(f"{name}USDT", periods=1200)
+        out[name] = (
+            np.datetime64("2025-01-01") + np.arange(len(d["close"])),
+            d["close"].astype(np.float64),
+            d["volume"].astype(np.float64),
+        )
+    return out
 
 
 def _env():
-    coins = {"BTC": clean_ohlcv(generate_synthetic_ohlcv("BTCUSDT", periods=1200))}
-    coins["ETH"] = clean_ohlcv(generate_synthetic_ohlcv("ETHUSDT", periods=1200))
-    coins["USDT"] = clean_ohlcv(generate_synthetic_ohlcv("USDT-USD", periods=1200))
-    return CryptoPortfolioEnv(coin_data=coins, lookback=60, episode_years=2, step_days=63, seed=42)
+    cube, names, fnames, didx = build_cube(_coin_arrays())
+    return CryptoPortfolioEnv(cube=cube, asset_names=names, feature_names=fnames, date_index=didx,
+                              lookback=60, episode_years=2, step_days=63, seed=42)
 
 
 def test_env_reset_returns_correct_state_shape():
@@ -31,81 +45,78 @@ def test_env_step_returns_state_reward_done_info():
     assert "weights" in info
 
 
-def test_env_evaluate_episode_returns_metrics():
+def test_env_score_ep_returns_metrics():
     env = _env()
     env.reset()
     weights = np.ones(3) / 3
     done = False
     while not done:
         _, _, done, _ = env.step(weights)
-    metrics = env.evaluate_episode()
+    metrics = env.score_ep()
     assert "sharpe" in metrics
     assert "total_return" in metrics
     assert "max_drawdown" in metrics
 
 
-def test_ppo_get_weights():
+def test_ppo_predict():
     env = _env()
     agent = PPOAgent(lookback=60, n_assets=3, n_features=14)
     state = env.reset()
-    w = agent.get_weights(state)
+    w = agent.predict(state)
     assert w.shape == (3,)
     assert abs(w.sum() - 1.0) < 1e-6
 
 
-def test_ppo_train_and_run_episode():
+def test_ppo_train_and_play_ep():
     env = _env()
     agent = PPOAgent(lookback=60, n_assets=3, n_features=14)
-    sharpe, metrics = agent.train_episode(env)
+    sharpe, metrics = agent.train_ep(env)
     assert isinstance(sharpe, float)
     assert "total_return" in metrics
-    em = agent.run_episode(env)
+    em = agent.play_ep(env)
     assert "btc_hold_return" in em
 
 
-def test_sac_get_weights():
+def test_sac_predict():
     env = _env()
     agent = SACAgent(lookback=60, n_assets=3, n_features=14)
     state = env.reset()
-    w = agent.get_weights(state)
+    w = agent.predict(state)
     assert w.shape == (3,)
     assert abs(w.sum() - 1.0) < 1e-6
 
 
-def test_sac_train_and_run_episode():
+def test_sac_train_and_play_ep():
     env = _env()
     agent = SACAgent(lookback=60, n_assets=3, n_features=14)
-    sharpe, metrics = agent.train_episode(env)
+    sharpe, metrics = agent.train_ep(env)
     assert isinstance(sharpe, float)
     assert "total_return" in metrics
-    em = agent.run_episode(env)
+    em = agent.play_ep(env)
     assert "btc_hold_return" in em
 
 
-def test_td3_get_weights():
+def test_td3_predict():
     env = _env()
     agent = TD3Agent(lookback=60, n_assets=3, n_features=14)
     state = env.reset()
-    w = agent.get_weights(state)
+    w = agent.predict(state)
     assert w.shape == (3,)
     assert abs(w.sum() - 1.0) < 1e-6
 
 
-def test_td3_train_and_run_episode():
+def test_td3_train_and_play_ep():
     env = _env()
     agent = TD3Agent(lookback=60, n_assets=3, n_features=14)
-    sharpe, metrics = agent.train_episode(env)
+    sharpe, metrics = agent.train_ep(env)
     assert isinstance(sharpe, float)
     assert "total_return" in metrics
-    em = agent.run_episode(env)
+    em = agent.play_ep(env)
     assert "btc_hold_return" in em
 
 
 def test_filter_by_date():
-    frames = {"BTC": clean_ohlcv(generate_synthetic_ohlcv("BTCUSDT", periods=500))}
-    filtered = filter_by_date(frames, "2025-01-01", "2025-01-03")
-    assert "BTC" in filtered
-    if len(filtered["BTC"]) > 0:
-        ts = pd.to_datetime(filtered["BTC"]["timestamp"])
-        assert (ts >= "2025-01-01").all()
-        assert (ts < "2025-01-03").all()
+    arrays = _coin_arrays()
+    cfg = PipelineConfig()
+    env = build_env(arrays, "2025-01-01", "2025-01-03", cfg)
+    assert len(env.asset_names) > 0

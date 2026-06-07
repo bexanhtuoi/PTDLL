@@ -1,63 +1,89 @@
 # Danh sách công việc triển khai
 
-> **Refactor hoàn thành:** Chuyển từ classification + REINFORCE pipeline → 3 RL models (PPO/SAC/TD3) + USDT cash. 11/11 tests pass.
+> **Hoàn thành core:** RL pipeline (PPO/SAC/TD3) + data pipeline + features. 11/11 tests pass. Risk layer đang xây dựng.
 
 ---
 
-## Kiến trúc cuối
+## Kiến trúc hiện tại
 
 ```
 src/
-├── config.py              # PipelineConfig: dates, params, hyperparams
-├── main.py                # Entry → models.train.run()
-├── utils.py               # I/O, sharpe_ratio, max_drawdown, win_rate, time split
-├── scores.py              # build_feature_table (RSI/MACD/returns/vol/dd)
+├── config.py                # PipelineConfig: dates, paths, hyperparams
+├── main.py                  # CLI: portfolio|risk {train|predict|report}
+├── log.py                   # File logger
+├── lib/
+│   ├── __init__.py
+│   ├── features.py          # Technical indicators (numpy, no pandas)
+│   ├── metrics.py           # Sharpe, drawdown, win_rate, ...
+│   ├── plot.py              # matplotlib charts
+│   └── utils.py             # JSON/CSV, date alignment, ffill, norm
 ├── dataset/
-│   └── fetch.py           # load_all_coins, aligned_prices, synthetic OHLCV
-├── models/
-│   ├── __init__.py        # Exports all 13 symbols
-│   ├── base.py            # BaseModel ABC + PolicyNet/ValueNet/StateEncoder/TwinQNet/DeterministicActor/ReplayBuffer
-│   ├── ppo.py             # PPOAgent(BaseModel)
-│   ├── sac.py             # SACAgent(BaseModel)
-│   ├── td3.py             # TD3Agent(BaseModel)
-│   ├── env.py             # CryptoPortfolioEnv + filter_by_date + aligned_features + build_env
-│   ├── train.py           # create_agent + train_model + run() orchestrator
-│   ├── evaluation.py      # run_test + print_results
-│   └── predict.py         # predict_weights + predict_portfolio_returns + export_to_onnx
-└── scripts/
-    └── visualize.py       # Charts: equity curve, allocation heatmap
+│   └── fetch.py             # 15 coins loader, synthetic, alignment
+├── portfolio/               # RL layer
+│   ├── base.py              # CryptoPortfolioEnv + BaseModel + 5 NNs
+│   ├── ppo.py / sac.py / td3.py
+│   ├── env.py / train.py / evaluate.py
+└── risk/                    # ML layer (đang xây)
+    ├── base.py              # StopANN, StopLSTM, StopNet, Embedding
+    ├── train.py             # train_risk()
+    ├── evaluate.py          # hit_rate, false_positive, saved_drawdown
+    └── predict.py           # predict_stop()
 ```
 
 ## Thứ tự đọc code
 
 1. `config.py` — hiểu tham số pipeline
-2. `scores.py` — feature engineering
-3. `models/base.py` — BaseModel contract + shared networks
-4. `models/env.py` — CryptoPortfolioEnv + state cube
-5. `models/ppo.py` — PPOAgent (ví dụ on-policy)
-6. `models/sac.py` — SACAgent (off-policy stochastic)
-7. `models/td3.py` — TD3Agent (off-policy deterministic)
-8. `models/train.py` — orchestrator ghép pipeline
-9. `models/evaluation.py` — test + results table
+2. `lib/features.py` — feature engineering (numpy, no pandas)
+3. `lib/metrics.py` — evaluation metrics
+4. `portfolio/base.py` — CryptoPortfolioEnv + BaseModel + shared NNs
+5. `portfolio/ppo.py / sac.py / td3.py` — 3 RL agents
+6. `portfolio/train.py` — orchestrator
+7. `report.py` — gen_report (figures, tables, LaTeX)
+8. `risk/base.py` — StopANN, StopLSTM, StopNet
+9. `risk/train.py / evaluate.py / predict.py` — risk pipeline
 
-## Đã xoá
+## Đã hoàn thành
 
-- `pipeline.py` → thay bằng `models/train.py:run()`
-- `models/rl.py` → thay bằng `models/ppo.py` + `sac.py` + `td3.py`
-- `dataset/labeling.py` — không cần buy/sell labels
-- `models/training.py` — classification train loop
-- `models/evaluation.py` — classification metrics
-- `models/export.py` — sklearn/LSTM ONNX export
-- `models/predict.py` — classification signal generation
-- `scripts/reports.py` — grid search
+### Data pipeline
+- [x] OHLCV loader, synthetic data generator
+- [x] shared_dates, ffill_grid, btc_grid alignment
+- [x] create_features (RSI, MACD, candle, returns, MA, vol, drawdown)
 
-## Lưu ý kiến trúc
+### RL Portfolio
+- [x] CryptoPortfolioEnv (gym-like, 15 assets, state cube)
+- [x] BaseModel ABC (predict, fit, save, load, eval_ckpt)
+- [x] PolicyNet, ValueNet, StateEncoder, TwinQNet, DeterministicActor
+- [x] PPOAgent (on-policy, clipped surrogate, GAE)
+- [x] SACAgent (off-policy, max entropy, auto temp)
+- [x] TD3Agent (off-policy, deterministic, delayed policy)
+- [x] train_seq / train_par (Windows-safe multiprocessing)
+- [x] USDT as risk-free asset
+- [x] 4 benchmarks (BTC hold, EW, momentum, risk parity)
+- [x] gen_report (figures: equity, sharpe history; tables: LaTeX)
 
-- **BaseModel ABC**: `forward()` → weights, `train_episode(env)` → loss, `run_episode(env)` → metrics dict
-- **USDT**: coin index 7, features ≈ 0, agent tự học hold cash naturally
-- **Train Concurrency**: validation chạy mỗi 50 episodes trong cùng vòng loop chính
-- **Episode = 2 years**: đủ dài để học multi-regime patterns
-- **State normalization**: z-score per channel (exclude weight channel)
-- **pyproject.toml**: `pythonpath = ["src"]` cho pytest
-- **Stop-Loss Layer**: [stop-loss.md](stop-loss.md) — 2 tầng (RL → Stop → Execute), 3 models đang so sánh
-- **Stop-loss cứng**: Set 1 lần sau RL allocate, check daily close, không trailing
+### Config & Tests
+- [x] PipelineConfig (pydantic-settings)
+- [x] 11 tests (env, 3 agents, indicators)
+- [x] --mode parallel / --episodes flag
+
+## Hoàn thành
+
+### Risk ML layer
+- [x] StopANN, StopLSTM, StopCNN trong risk/base.py + BaseStopModel ABC
+- [x] Embedding(14, 4) cho coin_id
+- [x] asym_mae loss (over=0.5, under=2.0) + boundary_reg (alpha=0.001)
+- [x] auto_label (window 90 ngày, buffer 20%)
+- [x] to_arrays (cache NPZ) + build_data (temporal split, label-safe) + train (fit loop)
+- [x] evaluate: eval_model (MAE, hit_rate) + compare
+- [x] predict: predict_stop(model, x_60d, coin_idx) → stop_%
+- [x] main.py risk CLI: train (--models ann|lstm|cnn|all)
+
+### Risk evaluation metrics
+- [x] hit_rate, false_positive_rate trong lib/metrics.py
+
+## Tương lai
+
+- [ ] Live trading + risk guardrails
+- [ ] Walk-forward validation (thay vì fixed test set)
+- [ ] ONNX deployment
+- [ ] Streamlit dashboard

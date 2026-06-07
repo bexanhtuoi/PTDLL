@@ -1,199 +1,208 @@
-# Stop-Loss Prediction Layer
+# Stop-Loss Prediction Layer (ML — Supervised Learning)
 
-> **Mục tiêu:** Sau khi RL phân bổ vốn vào coin nào, dự đoán `stop_loss_%` cho coin đó và đặt **stop-loss cứng** tại mức giá đó. Nếu giá chạm → tự động bán → USDT tăng → RL phân bổ lại.
+> **Mục tiêu:** Sau khi RL phân bổ vốn vào coin nào, dự đoán `stop_%` cho coin đó. Bài toán supervised learning đầu vào 60 ngày close → `stop_%` trong 90 ngày tới.
 
 ---
 
-## Luồng tổng thể
+## 1. Luồng tổng thể
 
 ```
-Khởi tạo: 100$ USDT
-   │
-   ▼
-┌─────────────────────────────────────┐
-│  USDT > 0?                          │
-└──────────┬──────────────────────────┘
-           │ Có
-           ▼
-┌─────────────────────────────────────┐
-│  RL phân bổ vốn                     │
-│  weights = [BTC: 0.3, ETH: 0.2...] │
-└──────────┬──────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────┐
-│  Set stop-loss cứng cho từng coin   │
-│  (gọi model 1 lần dự đoán stop_%)   │
-│                                     │
-│  stop_price = close × (1 - stop_%)  │
-│  CỐ ĐỊNH — không kéo lên            │
-│  USDT: không set stop               │
-└──────────┬──────────────────────────┘
-           │
-           ▼  Hàng ngày (chỉ check)
-┌─────────────────────────────────────┐
-│  close ≤ stop_price?                │
-│                                     │
-│  Nếu CÓ → auto sell → USDT          │
-│  Nếu KHÔNG → hold, chờ ngày mai     │
-└──────────┬──────────────────────────┘
-           │
-           └──→ USDT > 0? ──→ RL phân bổ lại
+RL allocate weights (15 coins)
+  │
+  ▼
+Với mỗi coin (trừ USDT) — gọi risk model:
+  predict(x_60d, coin_idx) → stop_% ∈ [0.05, 0.50]
+  stop_price = close × (1 - stop_%)
+  set stop_price CỐ ĐỊNH (không trailing, không thay đổi)
+  │
+  ▼ Hàng ngày (chỉ check, không gọi model)
+  close ≤ stop_price?
+    CÓ  → auto sell → USDT → RL re-allocate
+    KHÔNG → hold, chờ ngày mai
 ```
 
----
+**Không trailing**: stop_price set 1 lần, nếu close tăng thì stop_price giữ nguyên. Nếu coin sau đó đỏ mạnh thì stop vẫn còn.
 
-## Đặc điểm stop-loss cứng
+**Chỉ check daily close**: không intraday, dùng daily close price.
 
-| Tính chất | Mô tả |
-|-----------|-------|
-| **Cố định** | `stop_price` set 1 lần, không thay đổi đến khi bán hoặc RL re-allocate lại |
-| **Không trailing** | Không kéo lên theo peak, không theo dõi peak |
-| **Tự động** | Chạm là bán ngay, không cần can thiệp |
-| **Chỉ check daily** | Dùng daily close, không intraday |
+## 2. Auto-Labeling (Target)
 
-Sau khi RL re-allocate lại (vì có USDT từ coin bị stop), model sẽ dự đoán `stop_%` mới cho lần allocate đó — dựa trên market conditions mới nhất.
-
----
-
-## 1. Auto-Labeling
-
-Sinh target `stop_loss_%` từ dữ liệu lịch sử:
+Target được sinh tự động từ historical data — không cần label thủ công.
 
 ```python
-Với mỗi ngày T, mỗi coin:
-  close_T = giá hiện tại
-  future_close = close[T : T + 60]
-  low_future = min(future_close)
-  max_dd = (close_T - low_future) / close_T
+def auto_label(close_T: float, future_90d: np.ndarray) -> float:
+    # Drawdown thực tế trong 90 ngày tới
+    max_dd = (close_T - min(future_90d)) / close_T
 
-  # Target: drawdown × 1.2 — buffer 20% để không bán đáy
-  target = max_dd * 1.2
-  target = clip(target, 0.05, 0.50)
+    # Buffer 20% để không bán đáy
+    target = max_dd * 1.2
+    return clip(target, 0.05, 0.50)
 ```
 
-Vì stop là **cứng**, buffer 20% quan trọng hơn — không có trailing để kéo stop lên bù, nếu set sai là chết ngay.
+**Ý nghĩa**: Nếu coin thực sự đã đáy ở mức drawdown 20% trong 90 ngày tới, thì stop-loss nên đặt ở 24% (20% × 1.2) — đủ xa đáy 4% để tránh false positive.
 
----
+**Tại sao buffer 20%?** Vì stop là cứng, không trailing. Nếu đặt đúng đáy thì chỉ cần 1 biến động nhỏ là bị quét.
 
-## 2. Input & Output
+## 3. Model Input
 
-### Input
+### Per-coin, độc lập portfolio
+
 ```
-Shape: (lookback=60, n_assets=15, n_features=14)
-```
-
-| Index | Feature |
-|:-----:|---------|
-| 0 | return_1d |
-| 1 | return_7d |
-| 2 | return_30d |
-| 3 | return_90d |
-| 4 | volatility (20d) |
-| 5 | drawdown |
-| 6 | volume_change |
-| 7 | relative_strength_vs_BTC |
-| 8 | correlation_vs_BTC |
-| 9 | btc_ma200_position |
-| 10 | market_volatility |
-| 11 | btc_momentum_90d |
-| 12 | market_breadth |
-
-Kèm `weights` từ RL (để model biết coin nào nắm nhiều).
-
-### Output
-```
-1 giá trị mỗi coin (trừ USDT): predicted_stop_loss_pct ∈ [0.05, 0.50]
+Input:  x: (60, 13) — 60 ngày × 13 market features
+        coin_idx: int — 0..13 (index của coin, cho Embedding)
+Output: stop_% ∈ [0.05, 0.50] — scalar
 ```
 
-| Coin | Ví dụ | stop_price (close=100) |
-|------|:-----:|:---------------------:|
-| BTC | 18% | 82$ |
-| ETH | 25% | 75$ |
-| DOGE | 40% | 60$ |
-| USDT | 0% | Không set |
+### 13 features (không weight channel)
 
----
+| # | Feature | Ý nghĩa |
+|:-:|---------|---------|
+| 0 | return_1d | Daily return |
+| 1 | return_7d | 7-day return |
+| 2 | return_30d | 30-day return |
+| 3 | return_90d | 90-day return |
+| 4 | volatility | 20-day rolling vol |
+| 5 | drawdown | Distance from peak |
+| 6 | volume_change | Volume % change |
+| 7 | relative_strength_vs_BTC | Vs BTC 30d |
+| 8 | correlation_vs_BTC | 60d corr with BTC |
+| 9 | btc_ma200_position | BTC vs SMA200 |
+| 10 | market_volatility | Market avg vol |
+| 11 | btc_momentum_90d | BTC 90d momentum |
+| 12 | market_breadth | % coins positive |
 
-## 3. 3 Models So Sánh
-
-| Model | Loại | Ưu | Nhược |
-|-------|------|----|-------|
-| **ATR Baseline** | Rule | 0 train, interpretable | Không học pattern |
-| **XGBoost** | Tree | Feature importance, nhanh | Input flatten |
-| **Conv1D** | Deep | Temporal, share arch RL | Cần tuning |
-
-### ATR Baseline
-```python
-def predict_stop_atr(volatility_30d: np.ndarray) -> np.ndarray:
-    multiplier = np.where(volatility_30d < 0.05, 3.5,
-                np.where(volatility_30d < 0.10, 4.0,
-                np.where(volatility_30d < 0.20, 4.5, 5.0)))
-    return np.clip(volatility_30d * multiplier, 0.05, 0.50)
-```
-
-### XGBoost
-- Input flatten: `(batch, 12600)`
-- `n_estimators=500, max_depth=6, lr=0.05`
-
-### Conv1D (StopNet)
-```python
-class StopNet(nn.Module):
-    def __init__(self, lookback, n_assets, n_features):
-        super().__init__()
-        self.encoder = StateEncoder(lookback, n_assets, n_features, hidden=32)
-        self.head = nn.Sequential(
-            nn.Linear(32 + n_assets, 32), nn.ReLU(),
-            nn.Linear(32, n_assets),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, state, weights):
-        feat = self.encoder(state)
-        x = torch.cat([feat, weights], dim=1)
-        return self.head(x) * 0.45 + 0.05
-```
-
----
-
-## 4. Loss Function
+### Coin Embedding
 
 ```python
-def stop_loss_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    diff = predicted - target
-    penalty = torch.where(diff > 0, diff * 0.5, -diff * 2.0)
-    return penalty.mean()
+self.coin_emb = nn.Embedding(14, emb_dim=4)
+# 14 coins (trừ USDT) × 4-d vector học được
+# BTC gần ETH (cùng blue chip), DOGE xa DCR (khác họ)
 ```
 
----
+## 4. 3 Models
 
-## 5. Evaluation Metrics
+### Chung interface
 
-| Metric | Ý nghĩa |
-|--------|---------|
-| **MAE** | Sai số tuyệt đối |
-| **Hit Rate** | Stop không bị xuyên thủng |
-| **False Positive** | Chạm stop rồi hồi >10% sau 30d |
-| **Saved Drawdown** | Giảm drawdown so với không stop |
-
----
-
-## 6. Implementation Order
-
-```
-Step 1: Auto-labeling script → sinh target stop_%
-Step 2: ATR Baseline → benchmark
-Step 3: XGBoost → train + so sánh
-Step 4: Conv1D StopNet → train + so sánh
-Step 5: Backtest stop-loss riêng (không RL)
-Step 6: Tích hợp pipeline: RL → Stop → Check daily → USDT → RL loop
+```python
+class BaseStopModel(nn.Module, ABC):
+    emb = nn.Embedding(14, 4)
+    forward(x: (B, 60, 13), coin_idx: (B,) int) → (B, 1) stop_%
 ```
 
----
+### ANN (MLP Baseline)
 
-## 7. Success Criteria
+```
+Input: (B, 60, 13)
+  flatten(1) → (B, 780)
+  Linear(780 → 64) → ReLU → Dropout(0.3)
+  concat emb(4) → (B, 68)
+  Linear(68 → 32) → ReLU
+  Linear(32 → 1) → Sigmoid × 0.45 + 0.05
+Output: (B, 1)
+```
 
-1. **Hit Rate ≥ 80%**
-2. **False Positive ≤ 20%**
-3. **Saved Drawdown ≥ -10%** so với không stop
-4. **Sharpe cải thiện** so với RL baseline
+Đơn giản nhất, ignore temporal structure. Baseline để so LSTM/CNN.
+
+### LSTM
+
+```
+Input: (B, 60, 13)
+  emb = coin_emb(coin_idx) → (B, 4)
+  emb = unsqueeze(1) → expand(60) → (B, 60, 4)
+  concat x + emb → (B, 60, 17)
+  LSTM(17 → 64, batch_first) → h_n[-1] → (B, 64)
+  Linear(64 → 1) → Sigmoid × 0.45 + 0.05
+Output: (B, 1)
+```
+
+Học temporal pattern — momentum, drawdown tuần tự. Per-coin forward riêng (shared weights).
+
+### StopCNN
+
+```
+Input: (B, 60, 13)
+  permute(0, 2, 1) → (B, 13, 60)
+  Conv1d(13 → 32, k=3) → BatchNorm → ReLU → MaxPool(2)
+  Conv1d(32 → 64, k=3) → BatchNorm → ReLU → MaxPool(2)
+  flatten(1) → concat emb(4) → (B, ...)
+  Linear(... → 64) → ReLU
+  Linear(64 → 1) → Sigmoid × 0.45 + 0.05
+Output: (B, 1)
+```
+
+Temporal feature extraction bằng Conv1D stack + BatchNorm cho ổn định.
+
+## 5. Loss Functions
+
+### Asymmetric MAE
+
+```python
+def asym_mae(pred, target, over_w=0.5, under_w=2.0):
+    diff = pred - target
+    w = torch.where(diff > 0, over_w, under_w)
+    # diff > 0: pred > target (stop rộng → an toàn → phạt nhẹ)
+    # diff < 0: pred < target (stop hẹp → bán sớm → phạt nặng)
+    return (w * abs(diff)).mean()
+```
+
+- **Dự đoán thấp hơn target** (stop quá hẹp) → phạt 2× — nguy hiểm, bán đáy
+- **Dự đoán cao hơn target** (stop quá rộng) → phạt 0.5× — an toàn, chỉ lỡ lời nhiều hơn chút
+
+### Boundary Regularization
+
+```python
+def boundary_reg(pred, alpha=0.001):
+    margin = 0.01
+    near_min = relu(STOP_MIN + margin - pred)
+    near_max = relu(pred - (STOP_MAX - margin))
+    return alpha * (near_min + near_max).mean()
+```
+
+Phạt nhẹ α=0.001 khi output cách biên [0.05, 0.50] dưới 1%, tránh model collapse về 1 phía. Tổng loss: `asym_mae(pred, tgt) + boundary_reg(pred)`.
+
+## 6. Training
+
+### Dataset
+```python
+# Gộp tất cả coins, temporal split trước
+for coin_idx in range(14):      # 14 coins (trừ USDT)
+    for t in range(60, T - 90):
+        x = data[t-60:t, :13]   # (60, 13)
+        target = auto_label(data[t-60, 0], data[t:t+90, 0])
+        # (data[t-60, 0] = close at t-60, data[t:t+90, 0] = future close)
+
+# Temporal split: train 2017-2023, val 2023-2024, test 2024+
+# NGĂN LEAK: split TRƯỚC khi shuffle
+```
+
+### Data Split (temporal, label-safe)
+
+```
+Train:   dates < 2024-06-01 - 90 days  =  before 2024-03-03
+Val:     2024-06-01 ≤ dates < 2025-06-01
+Test:    2025-06-01 ≤ dates
+```
+
+### Hyperparams
+- Optimizer: Adam(lr=1e-3)
+- Batch: 256
+- Epochs: 100 (early stop patience 10)
+- Loss: `asym_mae(over=0.5, under=2.0) + boundary_reg(alpha=0.001)`
+- Metric: MAE (chính), hit rate (phụ)
+
+## 7. Evaluation Metrics
+
+| Metric | Ý nghĩa | Công thức |
+|--------|---------|-----------|
+| **MAE** | Sai số tuyệt đối | `mean(|pred - target|)` |
+| **Hit Rate** | Stop KHÔNG bị xuyên thủng | `mean(pred >= target)` |
+| **False Positive** | Chạm stop rồi hồi >10% sau 30d | `mean(hit & rebound)` |
+| **Saved Drawdown** | Giảm drawdown so với không stop | `dd_without - dd_with` |
+
+## 8. So sánh models
+
+| Model | Tham số | Temporal | Speed | Overfit risk |
+|-------|---------|----------|-------|-------------|
+| ANN | ~54K | ❌ batch | ⚡ nhanh | 🔴 cao (flatten mất structure) |
+| LSTM | ~56K | ✅ sequence | 🟡 trung bình | 🟡 vừa |
+| CNN | ~70K | ✅ conv | 🟡 trung bình | 🟢 thấp (BatchNorm) |

@@ -8,8 +8,13 @@ from pydantic_settings import BaseSettings
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data" / "raw"
 PROCESSED_DIR = ROOT / "data" / "processed"
-REPORT_DIR = ROOT / "results" / "reports"
 MODEL_DIR = ROOT / "models"
+FIGURES_DIR = ROOT / "results" / "figures"
+TABLES_DIR = ROOT / "results" / "tables"
+PREDICTIONS_DIR = ROOT / "results" / "predictions"
+HISTORY_PATH = ROOT / "results" / "portfolio_history.json"
+
+MODEL_TAGS: dict[str, str] = {"ppo": "PPO", "sac": "SAC", "td3": "TD3"}
 
 
 class PipelineConfig(BaseSettings, frozen=True):
@@ -31,5 +36,8 @@ class PipelineConfig(BaseSettings, frozen=True):
     lr: float = Field(default=3e-4, ge=1e-6, le=1e-2)
     gamma: float = Field(default=0.99, ge=0.9, le=0.999)
     entropy_coef: float = Field(default=0.02, ge=0, le=0.1)
+
+    checkpoint_interval: int = Field(default=0, ge=0, le=10000)
+    early_stop_patience: int = Field(default=20, ge=0, le=200)
 
     model_config = {"frozen": True}

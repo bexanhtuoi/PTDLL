@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn, optim
 
-from models.base import BaseModel, DeterministicActor, ReplayBuffer, TwinQNet
+from portfolio.base import BaseModel, DeterministicActor, ReplayBuffer, TwinQNet
 
 
 class TD3Agent(BaseModel):
@@ -48,12 +48,12 @@ class TD3Agent(BaseModel):
 
         self.buffer = ReplayBuffer(replay_capacity)
 
-    def get_weights(self, state: np.ndarray) -> np.ndarray:
+    def predict(self, state: np.ndarray) -> np.ndarray:
         self.actor.eval()
         with torch.no_grad():
             return self.actor(torch.from_numpy(state).unsqueeze(0).to(self.device)).squeeze(0).cpu().numpy()
 
-    def _act(self, state: np.ndarray) -> np.ndarray:
+    def act(self, state: np.ndarray) -> np.ndarray:
         self.actor.eval()
         with torch.no_grad():
             state_t = torch.from_numpy(state).unsqueeze(0).to(self.device)
@@ -68,26 +68,26 @@ class TD3Agent(BaseModel):
                 weights = np.ones_like(weights) / len(weights)
             return weights
 
-    def train_episode(self, env, start_idx: int | None = None, end_idx: int | None = None) -> tuple[float, dict]:
+    def train_ep(self, env, start_idx: int | None = None, end_idx: int | None = None) -> tuple[float, dict]:
         state = env.reset(start_idx=start_idx, end_idx=end_idx)
         done = False
         while not done:
-            action = self._act(state)
+            action = self.act(state)
             next_state, reward, done, info = env.step(action)
             self.buffer.push(state.copy(), action.copy(), reward, next_state.copy(), done)
             state = next_state
             self.total_steps += 1
             if len(self.buffer) >= self.batch_size:
                 s_b, a_b, r_b, ns_b, d_b = self.buffer.sample(self.batch_size, self.device)
-                self._update_critic(s_b, a_b, r_b, ns_b, d_b)
+                self.update_critic(s_b, a_b, r_b, ns_b, d_b)
                 if self.total_steps % self.policy_delay == 0:
-                    self._update_actor(s_b)
-                    self._soft_update(self.critic, self.target_critic)
-                    self._soft_update(self.actor, self.target_actor)
-        metrics = env.evaluate_episode()
+                    self.update_actor(s_b)
+                    self.soft_update(self.critic, self.target_critic)
+                    self.soft_update(self.actor, self.target_actor)
+        metrics = env.score_ep()
         return metrics.get("sharpe", 0.0), metrics
 
-    def _update_critic(self, state, action, reward, next_state, done):
+    def update_critic(self, state, action, reward, next_state, done):
         with torch.no_grad():
             next_action = self.target_actor(next_state)
             noise = torch.normal(0, self.policy_noise, size=next_action.shape, device=self.device)
@@ -103,32 +103,23 @@ class TD3Agent(BaseModel):
         critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
-    def _update_actor(self, state):
+    def update_actor(self, state):
         action = self.actor(state)
         q = self.critic.q1_forward(state, action)
         entropy = -(action * torch.log(action + 1e-10)).sum(dim=1).mean()
         actor_loss = -q.mean() - self.entropy_coef * entropy
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
-    def _soft_update(self, net, target):
+    def soft_update(self, net, target):
         with torch.no_grad():
             for p, tp in zip(net.parameters(), target.parameters()):
                 tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
-
-    def run_episode(self, env, start_idx: int | None = None, end_idx: int | None = None) -> dict:
-        self.actor.eval()
-        state = env.reset(start_idx=start_idx, end_idx=end_idx)
-        done = False
-        while not done:
-            with torch.no_grad():
-                weights = self.actor(torch.from_numpy(state).unsqueeze(0).to(self.device)).squeeze(0).cpu().numpy()
-            next_state, reward, done, info = env.step(weights)
-            state = next_state
-        return env.evaluate_episode(env.compute_benchmarks())
 
     def state_dict(self) -> dict:
         return {

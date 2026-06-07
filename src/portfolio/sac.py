@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn, optim
 
-from models.base import BaseModel, PolicyNet, ReplayBuffer, TwinQNet
+from portfolio.base import BaseModel, PolicyNet, ReplayBuffer, TwinQNet
 
 
 class SACAgent(BaseModel):
@@ -41,13 +41,13 @@ class SACAgent(BaseModel):
 
         self.buffer = ReplayBuffer(replay_capacity)
 
-    def get_weights(self, state: np.ndarray) -> np.ndarray:
+    def predict(self, state: np.ndarray) -> np.ndarray:
         self.actor.eval()
         with torch.no_grad():
             logits = self.actor(torch.from_numpy(state).unsqueeze(0).to(self.device))
             return torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-    def _sample_action(self, state_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample_action(self, state_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.actor(state_t)
         logits = torch.clamp(logits, -20, 20)
         probs = torch.softmax(logits, dim=1)
@@ -57,50 +57,52 @@ class SACAgent(BaseModel):
         log_prob = dist.log_prob(action)
         return action, log_prob
 
-    def _get_alpha(self) -> torch.Tensor:
+    def get_alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    def train_episode(self, env, start_idx: int | None = None, end_idx: int | None = None) -> tuple[float, dict]:
+    def train_ep(self, env, start_idx: int | None = None, end_idx: int | None = None) -> tuple[float, dict]:
         state = env.reset(start_idx=start_idx, end_idx=end_idx)
         done = False
         while not done:
             self.actor.eval()
             with torch.no_grad():
                 state_t = torch.from_numpy(state).unsqueeze(0).to(self.device)
-                action, _ = self._sample_action(state_t)
+                action, _ = self.sample_action(state_t)
                 action = action.squeeze(0).cpu().numpy()
             next_state, reward, done, info = env.step(action)
             self.buffer.push(state.copy(), action.copy(), reward, next_state.copy(), done)
             state = next_state
             if len(self.buffer) >= self.batch_size:
                 s_b, a_b, r_b, ns_b, d_b = self.buffer.sample(self.batch_size, self.device)
-                self._update_critic(s_b, a_b, r_b, ns_b, d_b)
-                self._update_actor_and_alpha(s_b)
-                self._soft_update()
-        metrics = env.evaluate_episode()
+                self.update_critic(s_b, a_b, r_b, ns_b, d_b)
+                self.update_actor_alpha(s_b)
+                self.soft_update()
+        metrics = env.score_ep()
         return metrics.get("sharpe", 0.0), metrics
 
-    def _update_critic(self, state, action, reward, next_state, done):
+    def update_critic(self, state, action, reward, next_state, done):
         with torch.no_grad():
-            next_action, next_log_prob = self._sample_action(next_state)
+            next_action, next_log_prob = self.sample_action(next_state)
             q1_target, q2_target = self.target_critic(next_state, next_action)
             q_target = torch.min(q1_target, q2_target)
-            alpha = self._get_alpha()
+            alpha = self.get_alpha()
             q_target = reward + self.gamma * (1 - done) * (q_target - alpha * next_log_prob.unsqueeze(1))
         q1, q2 = self.critic(state, action)
         critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
-    def _update_actor_and_alpha(self, state):
-        action, log_prob = self._sample_action(state)
-        alpha = self._get_alpha()
+    def update_actor_alpha(self, state):
+        action, log_prob = self.sample_action(state)
+        alpha = self.get_alpha()
         q1, q2 = self.critic(state, action)
         q = torch.min(q1, q2)
         actor_loss = (alpha * log_prob.unsqueeze(1) - q).mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
         alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
@@ -108,22 +110,10 @@ class SACAgent(BaseModel):
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
-    def _soft_update(self):
+    def soft_update(self):
         with torch.no_grad():
             for p, tp in zip(self.critic.parameters(), self.target_critic.parameters()):
                 tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
-
-    def run_episode(self, env, start_idx: int | None = None, end_idx: int | None = None) -> dict:
-        self.actor.eval()
-        state = env.reset(start_idx=start_idx, end_idx=end_idx)
-        done = False
-        while not done:
-            with torch.no_grad():
-                logits = self.actor(torch.from_numpy(state).unsqueeze(0).to(self.device))
-                weights = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-            next_state, reward, done, info = env.step(weights)
-            state = next_state
-        return env.evaluate_episode(env.compute_benchmarks())
 
     def state_dict(self) -> dict:
         return {

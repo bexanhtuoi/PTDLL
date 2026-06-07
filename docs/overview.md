@@ -1,122 +1,104 @@
-# PTDLL — RL Portfolio Allocation
+# PTDLL — RL Portfolio Allocation + Risk Stop-Loss
 
-> **Mục tiêu:** Hệ thống **RL portfolio allocation** với USDT làm risk-free asset. 3 models (PPO, SAC, TD3) so sánh trên cùng environment. **Không dùng classification** — agent tự học phân bổ vốn + hold cash.
+> **Mục tiêu:** Hệ thống 2 tầng — **RL portfolio allocation** (PPO/SAC/TD3) phân bổ vốn 15 coins + USDT, **risk ML layer** (ANN/LSTM/CNN) dự đoán stop-loss % từng coin.
 
 ## Kiến trúc
 
 ```
 src/
-├── config.py              # PipelineConfig: train/val/test dates, episode params
-├── main.py                # Entry → models.train.run()
-├── utils.py               # sharpe, max_drawdown, save helpers
-├── scores.py              # build_feature_table (RSI, MACD, returns, ...)
+├── config.py                # PipelineConfig: dates, paths, hyperparams
+├── main.py                  # CLI: portfolio|risk {train|predict|report}
+├── log.py                   # File logger per module
+├── lib/
+│   ├── features.py          # pct_change, rolling_xx, RSI, MACD, candle, ...
+│   ├── metrics.py           # sharpe, sortino, max_drawdown, win_rate, ...
+│   ├── plot.py              # multi_line, equity_curve, heatmap, histogram, ...
+│   └── utils.py             # save/load JSON/CSV, shared_dates, ffill_grid, norm_w
 ├── dataset/
-│   └── fetch.py           # 15 coins OHLCV loader, synthetic data, align
-├── models/
-│   ├── base.py            # BaseModel (ABC) + PolicyNet, ValueNet, TwinQNet, ...
-│   ├── ppo.py             # PPOAgent(BaseModel): on-policy, clipped surrogate
-│   ├── sac.py             # SACAgent(BaseModel): off-policy, max entropy
-│   ├── td3.py             # TD3Agent(BaseModel): off-policy, deterministic
-│   ├── env.py             # CryptoPortfolioEnv + aligned_features
-│   ├── train.py           # create_agent, train_model, run()
-│   ├── evaluation.py      # run_test, print_results
-│   └── predict.py         # predict_weights, export_to_onnx
-├── scripts/
-│   └── visualize.py       # equity curve + allocation heatmap
-└── (planning) stop_loss/
-    ├── label.py           # Auto-labeling target stop_%
-    ├── baseline.py        # ATR Baseline (rule-based)
-    ├── xgb_model.py       # XGBoost Regressor
-    ├── stopnet.py         # Conv1D StopNet
-    └── evaluate.py        # Evaluation & comparison
+│   └── fetch.py             # COINS_15 (15 coins), crawl_yfinance, generate_synthetic_ohlcv, load_coin_arrays
+├── portfolio/
+│   ├── env.py               # build_env → CryptoPortfolioEnv
+│   ├── base.py              # CryptoPortfolioEnv, BaseModel ABC, 5 NN modules, ReplayBuffer
+│   ├── ppo.py               # PPOAgent(BaseModel)
+│   ├── sac.py               # SACAgent(BaseModel)
+│   ├── td3.py               # TD3Agent(BaseModel)
+│   ├── train.py             # train_seq, train_par, _train_one, train_save
+│   └── evaluate.py          # make_agent, load_agent, sim_agent, eval_agent, log_results
+├── risk/
+│   ├── base.py              # StopANN, StopLSTM, StopCNN, BaseStopModel, Embedding, asym_mae, boundary_reg, auto_label
+│   ├── train.py             # to_arrays (cache), build_data (temporal split), train (fit loop)
+│   ├── evaluate.py          # eval_model, compare (dùng lib/metrics hit_rate)
+│   └── predict.py           # predict_stop(model, x_60d, coin_idx) → stop_%
+└── report.py                # gen_report → figures, tables, history
 ```
 
-> **2-tier architecture**: RL allocate → Stop-loss predict stop_% per coin → Daily check → Sell on hit → USDT → RL re-allocate
+## 2-Tier Flow
 
-## 3 RL Models
-
-| Model | Paradigm | Policy | Critic | Update Mechanism |
-|-------|----------|--------|--------|-----------------|
-| **PPO** | On-policy stochastic | `PolicyNet` (Conv1D+FC) | `ValueNet` (Conv1D+FC) | Clipped surrogate + GAE(λ=0.95) + K=4 epochs |
-| **SAC** | Off-policy stochastic | `PolicyNet` | `TwinQNet` (twin Q) | Min double Q + auto entropy α + soft update |
-| **TD3** | Off-policy deterministic | `DeterministicActor` (softmax) | `TwinQNet` | Clipped double Q + delayed policy + target smoothing |
-
-### Network architecture
 ```
-Input:  (batch, L=60, A=15, F=14)
-            ↓ reshape (batch, A*F=210, L=60)
-     Conv1d(210→64, k=5) + ReLU + AdaptiveAvgPool → (batch, 64)
-            ↓
-     FC(64→128) → ReLU → FC(128→64) → ReLU → FC(64→n_assets)
-            ↓
-     Dirichlet(softmax×15 + 1) / softmax → allocation weights
+RL allocate weights (15) ── 60d lookback, 90d rebalance
+  │
+  ▼
+Set stop-loss cho từng coin (trừ USDT):
+  predict(x_60d, coin_idx) → stop_% ∈ [0.05, 0.50]
+  stop_price = close × (1 - stop_%)
+  stop_price CỐ ĐỊNH — không trailing, không thay đổi
+
+Hàng ngày: check daily close ≤ stop_price?
+  CÓ    → auto sell → USDT → RL re-allocate
+  KHÔNG → hold
 ```
+
+## 2 Layer
+
+| Layer | Loại | Models | Input | Output |
+|-------|------|--------|-------|--------|
+| **Portfolio (RL)** | Reinforcement Learning | PPO, SAC, TD3 | state cube (60,15,14) | allocation weights (15,) |
+| **Risk (ML)** | Supervised Learning | ANN, LSTM, CNN | x (60,13) + coin_idx | stop_% ∈ [0.05, 0.50] per coin |
+
+## Feature Cube (14 channels)
+
+```
+build_cube(coin_data) → cube (T, 15, 14)
+
+  ├── Per-coin (7): return_1d, 7d, 30d, 90d, volatility, drawdown, volume_change
+  │     └── từ coin_fx(close, volume)
+  ├── Cross-coin (2): relative_strength_vs_BTC, correlation_vs_BTC
+  │     └── từ cross_fx(per_coin)
+  ├── Market (4): btc_ma200_position, market_volatility, btc_momentum_90d, market_breadth
+  │     └── từ mkt_regime(per_coin, btc_close)
+  └── Weight (1): injected by env.get_state() tại runtime
+```
+
+RL dùng cả 14 channels. Risk dùng 13 channel đầu (bỏ weight).
 
 ## Data Split
 
-| Split | Range | Duration |
-|-------|-------|----------|
-| Train | 2017-01-01 → 2024-06-01 | ~7 năm (2396 days) |
-| Validation | 2024-06-01 → 2025-06-01 | ~1 năm |
-| Test | 2025-06-01 → 2026-06-01 | ~1 năm |
+| Split | Range | Duration | Dùng cho |
+|-------|-------|----------|----------|
+| Train | 2017-01-01 → 2024-06-01 | ~7 năm | RL training + risk training |
+| Validation | 2024-06-01 → 2025-06-01 | ~1 năm | RL val (Sharpe tracking) + risk val |
+| Test | 2025-06-01 → 2026-06-01 | ~1 năm | RL test + risk test |
 
-## Episode Design
-
-- **Episode**: 2 năm (730 days) — random window trong train
-- **Step**: 90 days → ~8 steps/episode (730/90)
-- **Lookback**: 60 days
-- **Fee**: 0.1% per rebalance
-- **Reward**: `excess_return - 0.1×vol - 0.05×dd_90 - 0.001×turnover`
-
-## USDT Integration
-
-USDT (coin thứ 8/15) có features ≈ 0. Agent allocate weight vào USDT = hold cash. Không cần classification buy/sell riêng — agent tự học khi nào nên ở ngoài thị trường.
-
-## Pipeline (`models/train.py:run`)
-
-```
-1. Clean outputs → xoá results/
-2. Load 15 coins → filter_by_date (train/val/test)
-3. Build envs: CryptoPortfolioEnv × 3 splits
-4. For each model (PPO → SAC → TD3):
-   a. create_agent
-   b. train_model: 5000 episodes, val every 50 eps
-   c. save checkpoint → models/{name}.pt
-   d. run_test on test set
-5. Print comparison table
-6. Publish artifacts
-```
-
-## Kết quả hiện tại
-
-| Model | Val Sharpe (avg) | Test Sharpe | Test Return | Pos Rate |
-|-------|:-:|:-:|:-:|:-:|
-| PPO | 1.00 | -0.79 | -54% | 0% |
-| SAC | 1.05 | +0.18 | -5% | 100% |
-
-> SAC outperform PPO trên test set (Sharpe +0.18 vs -0.79). TD3 đang chạy.
-> Val Sharpe của cả 2 đều >1.0 — models học được policy có kỹ năng trên validation.
-
-## State cube
-
-```
-(T, 15 assets, 14 features)
-├── 0: return_1d
-├── 1: return_7d
-├── 2: return_30d
-├── 3: return_90d
-├── 4: volatility (20d)
-├── 5: drawdown
-├── 6: volume_change (clipped [-5, 5])
-├── 7: relative_strength_vs_BTC
-├── 8: correlation_vs_BTC (rolling 60d)
-├── 9: btc_ma200_position
-├── 10: market_volatility
-├── 11: btc_momentum_90d
-├── 12: market_breadth
-└── 13: weight (injected by env)
-```
+Risk train samples bị giới hạn thêm: chỉ lấy sample có `date[t] + 90 ≤ train_end` (label window không leak vào val), nên train risk thực tế = 2018-01-08 → 2024-03-02.
 
 ## Tests
 
-11 tests — env, PPO/SAC/TD3 agents, indicators, filter_by_date. Pass all.
+11 unit tests pass — env, PPO/SAC/TD3 agents, indicators.
+
+## Risk Label Distribution
+
+Với real yfinance data (2017→2026), 40,404 samples:
+
+| Split | Samples | Mean | < 10% | 10–30% | > 40% |
+|-------|--------:|:----:|:-----:|:------:|:-----:|
+| Train | 31,444 | 0.276 | 25% | 30% | 33% |
+| Validation | 5,110 | 0.225 | 28% | 44% | 19% |
+| Test | 3,850 | 0.291 | 22% | 24% | 35% |
+
+## Results (2026-06-03)
+
+| Model | Val Sharpe | Test Sharpe | Test Return |
+|-------|:----------:|:-----------:|:-----------:|
+| PPO | 1.00 | -0.79 | -54% |
+| SAC | 1.05 | +0.18 | -5% |
+| TD3 | — | — | — |

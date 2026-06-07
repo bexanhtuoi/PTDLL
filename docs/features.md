@@ -1,165 +1,98 @@
-# Đặc tả tính năng
+# Features
 
-## ✅ Đã hoàn thành — Data Pipeline
+Tất cả features được tính trong `portfolio/base.py` (build_cube → coin_fx, cross_fx, mkt_regime, stack_cube). Không dùng pandas — thuần numpy.
 
-### F-DATA — OHLCV Loader
-- [x] Load 15 coins từ CSV (hoặc generate synthetic cho test)
-- [x] `generate_synthetic_ohlcv`: random walk + trend + volume
-- [x] `clean_ohlcv`: sort, drop duplicates, ép numeric
-- [x] `aligned_prices`: align multi-coin close prices theo timestamp chung
+## 1. Per-coin Features (7 features)
 
-### F-FEAT — Feature Engineering
-- [x] `build_feature_table()`: RSI, MACD, rolling returns 1/7/30/90d, volatility, drawdown, volume_change, relative_volume, distance_to_ma, trend_regime
-- [x] `feature_columns` list — 9 technical features
-- [x] `aligned_features()`: multi-coin feature cube `(T, 15, 10)`
-- [x] Per-coin features (7): return_1d/7d/30d/90d, volatility, drawdown, volume_change
-- [x] Cross-sectional features (2): relative_strength_vs_BTC, correlation_vs_BTC
-- [x] Weight injection (1): current allocation weights (env injects)
-- [x] State normalization: z-score per channel (exclude weight channel)
+Tính từng coin riêng biệt trong hàm `coin_fx()`.
 
----
+| # | Feature | Hàm | Ý nghĩa | Công thức |
+|:-:|---------|-----|---------|-----------|
+| 0 | `return_1d` | `pct_change(close, 1)` | Daily close return | `(close[t] - close[t-1]) / close[t-1]` |
+| 1 | `return_7d` | `pct_change(close, 7)` | 7-day return | `(close[t] - close[t-7]) / close[t-7]` |
+| 2 | `return_30d` | `pct_change(close, 30)` | 30-day return | `(close[t] - close[t-30]) / close[t-30]` |
+| 3 | `return_90d` | `pct_change(close, 90)` | 90-day return (momentum) | `(close[t] - close[t-90]) / close[t-90]` |
+| 4 | `volatility` | `rolling_std(ret_1d, 20)` | 20-day rolling vol | `std(ret_1d[19:])` |
+| 5 | `drawdown` | `dd_series(close)` | Distance from peak | `close[t] / max(close[:t+1]) - 1` |
+| 6 | `volume_change` | `pct_change(volume, 1)` | Daily volume change | `(vol[t] - vol[t-1]) / vol[t-1], clip [-5,5]` |
 
-## ✅ Đã hoàn thành — RL Portfolio
+**Volume ratio** (`volume / rolling_mean(volume, 20)`) — dùng cho analysis nhưng không trong state cube.
 
-### F-BASE — BaseModel ABC + Shared Networks
-- [x] `BaseModel` (ABC): `forward`, `get_weights`, `train_episode`, `run_episode`, `save`, `load`
-- [x] `PolicyNet`: Conv1d(150→64, k=5) + FC(64→128→64→n_assets), Dirichlet policy
-- [x] `ValueNet`: Conv1d(150→32, k=5) + FC(32→64→1)
-- [x] `StateEncoder`: Conv1d(150→64, k=5) + ReLU + AdaptiveAvgPool1d → FC(64→128)
-- [x] `TwinQNet`: StateEncoder × 2 output heads
-- [x] `DeterministicActor`: StateEncoder + FC(128→64→n_assets) + softmax
-- [x] `ReplayBuffer`: deque(maxlen=100_000), `sample(batch)` returns stacked tensors
+## 2. Cross-coin Features (2 features)
 
-### F-PPO — PPO Agent
-- [x] `PPOAgent(BaseModel)`: on-policy, clipped surrogate objective
-- [x] GAE(λ=0.95) advantage estimation
-- [x] K=4 epochs per update, minibatch
-- [x] Dirichlet policy (concentration = logits×10 + 1)
-- [x] Policy loss = -min(ratio×A, clip(ratio, 1-ε, 1+ε)×A)
-- [x] Value loss = smooth L1
-- [x] Entropy bonus (coef=0.01)
-- [x] Gradient clip norm = 1.0
-- [x] Adam(lr=3e-4) for both policy and value nets
-- [x] LR scheduler: StepLR ×0.5/2000eps
+Tính từ ma trận per-coin trong `cross_fx()`.
 
-### F-SAC — SAC Agent
-- [x] `SACAgent(BaseModel)`: off-policy, maximum entropy
-- [x] Twin Q-net (min double Q to reduce overestimation)
-- [x] Soft target update (τ=0.005)
-- [x] Auto entropy tuning (learned log_alpha, target_entropy = -n_assets)
-- [x] Dirichlet policy (rsample for reparameterization)
-- [x] Replay buffer experience replay
-- [x] Adam(lr=3e-4) × 3 optimizers (policy, Q1, Q2)
+| # | Feature | Ý nghĩa | Công thức |
+|:-:|---------|---------|-----------|
+| 7 | `relative_strength_vs_BTC` | Coin outperform BTC? | `return_30d[coin] - return_30d[BTC]` |
+| 8 | `correlation_vs_BTC` | Tương quan với BTC | `corr(return_1d[coin], return_1d[BTC], 60 ngày)` |
 
-### F-TD3 — TD3 Agent
-- [x] `TD3Agent(BaseModel)`: off-policy, deterministic actor
-- [x] DeterministicActor + softmax allocation
-- [x] Twin critics (clipped double Q-learning)
-- [x] Delayed policy update (every 2 steps)
-- [x] Target policy smoothing (Gaussian noise σ=0.1, clipped [-0.5, 0.5])
-- [x] Soft target update
-- [x] Replay buffer
+`correlation` dùng window 60 ngày, tính `np.corrcoef` manual (không pandas).
 
-### F-ENV — CryptoPortfolioEnv
-- [x] `CryptoPortfolioEnv`: gym.Env-like interface
-- [x] Reset: random 2-year window → state cube `(lookback=60, 15, 10)`
-- [x] Step: allocate weights, hold 90 days, compute portfolio return
-- [x] Reward: `excess_return - 0.1×vol - 0.05×dd_90 - 0.001×turnover`
-- [x] Rebalance fee: 0.1%
-- [x] Weight normalization: `w = clip(w, 0, 1)`, then `w /= sum(w)`
-- [x] 4 benchmarks: BTC hold, equal-weight, top momentum, risk parity
-- [x] Episode evaluation: Sharpe, return, drawdown, turnover, win_rate
+## 3. Market Regime Features (4 features)
 
-### F-TRAIN — Training Orchestrator
-- [x] `create_agent(name, config)`: returns PPOAgent | SACAgent | TD3Agent
-- [x] `train_model(agent, train_env, val_env, n_episodes)`: loop with concurrent validation
-- [x] Validation every 50 episodes: run 1 val episode → record metrics
-- [x] Track best Val Sharpe → save checkpoint
-- [x] `run()` orchestrator: load coins → 3 envs → train 3 agents → test → publish
+Tính từ toàn bộ thị trường trong `mkt_regime()`.
 
-### F-EVAL — Evaluation
-- [x] `run_test(agent, env, n_test)`: multi-episode test (avg ± std across episodes)
-- [x] `print_results(results_dict)`: model comparison table
-- [x] Test metrics: Sharpe, return, drawdown, turnover, positive Sharpe %
+| # | Feature | Ý nghĩa | Công thức |
+|:-:|---------|---------|-----------|
+| 9 | `btc_ma200_position` | BTC cách SMA200 bao xa | `(BTC - SMA200) / SMA200` |
+| 10 | `market_volatility` | Vol trung bình toàn thị trường | `mean(volatility của 15 coins)` |
+| 11 | `btc_momentum_90d` | BTC momentum 3 tháng | `(BTC[t] - BTC[t-90]) / BTC[t-90]` |
+| 12 | `market_breadth` | Tỷ lệ coin xanh | `mean(return_30d > 0)` |
 
-### F-PREDICT — Prediction / Export
-- [x] `predict_weights(agent, env)`: run deterministic policy → final allocation vector
-- [x] `predict_portfolio_returns(agent, env)`: cumulative returns over episode
-- [x] `export_to_onnx(agent, n_assets, lookback, n_features, filepath)`: ONNX export
+## 4. Weight Feature (chỉ RL, không risk)
 
----
+| # | Feature | Ý nghĩa | Nguồn |
+|:-:|---------|---------|-------|
+| 13 | `weight` | Current allocation weight | Injected bởi env tại runtime |
 
-## ✅ Đã hoàn thành — USDT Integration
+Weight là channel cuối, **không được normalize** (z-score) cùng các feature khác. Giúp RL biết đang nắm bao nhiêu mỗi coin.
 
-### F-USDT — Cash Decision
-- [x] USDT (coin index 7) là 1 trong 15 assets
-- [x] Features đều ≈ 0 (return=0, vol=0, dd=0)
-- [x] Agent có thể allocate weight vào USDT = hold cash
-- [x] **Không cần classification buy/sell riêng**
+## 5. Risk Input (13 features)
 
----
+Risk model chỉ dùng **13 features đầu** (không weight channel):
+```
+return_1d, return_7d, return_30d, return_90d,
+volatility, drawdown, volume_change,
+relative_strength_vs_BTC, correlation_vs_BTC,
+btc_ma200_position, market_volatility, btc_momentum_90d,
+market_breadth
+```
 
-## ✅ Đã hoàn thành — Config & Tests
+Shape: `(60, 13)` — 60 ngày lookback, 1 coin. Coin index dùng Embedding riêng.
 
-### F-CONFIG — PipelineConfig
-- [x] Pydantic BaseSettings (`config.py`): train/val/test dates, episode params, RL hyperparams
-- [x] All params overrideable via env vars
+## 6. Volume helpers (extra, analysis)
 
-### F-TESTS — Unit Tests (11 tests)
-- [x] `test_env_reset_shape`: env reset → state shape = (60, 15, 10)
-- [x] `test_env_step`: env step → action_shape, reward_scalar, done_bool
-- [x] `test_agent_weights`: agent.get_weights() returns valid distribution
-- [x] `test_ppo_train_episode`: PPO train → loss ~0 no NaN
-- [x] `test_ppo_run_episode`: PPO run → valid returns
-- [x] `test_sac_train_episode`: SAC train → loss ~0 no NaN
-- [x] `test_sac_run_episode`: SAC run → valid returns
-- [x] `test_td3_train_episode`: TD3 train → loss ~0 no NaN
-- [x] `test_td3_run_episode`: TD3 run → valid returns
-- [x] `test_filter_by_date`: time split works correctly
+Từ `lib/features.py:volume()`:
+- `volume_change` — daily % change, clipped [-5, 5] (đã là feature 6)
+- `volume_ratio` — volume / rolling_mean(volume, 20) — dùng phân tích
 
----
+## 7. OHLCV derived features
 
-## ✅ Đã hoàn thành — Deleted (Classification pipeline)
+Từ `lib/features.py:candle()` + `returns()` + `ma()` + `volatility()` + `rsi()` + `macd()`:
+- `create_features()` tổng hợp tất cả, dùng cho phân tích offline
+- **Không dùng** trong state cube — state cube chỉ lấy sub-set từ `coin_fx()`
 
-- [x] **Xoá** `models/rl.py` — REINFORCE PGAgent → thay bằng PPO/SAC/TD3
-- [x] **Xoá** `pipeline.py` — pipeline orchestration → thay bằng `models/train.py:run()`
-- [x] **Xoá** `dataset/labeling.py` — SMA crossover / threshold labels
-- [x] **Xoá** `models/training.py` — classification train/eval loops
-- [x] **Xoá** `models/evaluation.py` — classification metrics / confusion matrix
-- [x] **Xoá** `models/export.py` — ONNX export cho sklearn/LSTM
-- [x] **Xoá** `models/predict.py` — classification signal generation
-- [x] **Xoá** `scripts/reports.py` — grid search
-- [x] **Xoá** SVD pipeline, t-SNE khỏi `scores.py`
+## 8. 15 Coins
 
----
+Từ `dataset/fetch.py:COINS_15`:
+```
+BTC, LTC, XRP, DOGE, XMR, DASH, XLM, USDT,
+ETH, ETC, WAVES, ZEC, DCR, NEO, BNB
+```
 
-## 📋 Chưa làm / Optional
+USDT là stablecoin → features ≈ 0. USDT không dùng cho stop-loss prediction.
 
-- [ ] Train TD3 đầy đủ 5000 episodes (đang chạy)
-- [ ] Tăng n_episodes cho SAC để hội tụ tốt hơn
-- [ ] Early stopping theo Val Sharpe
-- [ ] Allocation heatmap visualization
-- [ ] ONNX deployment script
-- [ ] Streamlit dashboard
-- [ ] Paper trading
-- [ ] Live trading + risk guardrails
+## 9. Tổng hợp state cube
 
----
+```
+build_cube(coin_data) → (T, 15, 14), feature_names, asset_names, date_index
 
-## 📋 Đang Planning — Stop-Loss Layer
+Luồng:
+  per_coin = asset_cube(coin_data, shorts, grid, T)     # (T, 15, 7)
+  rel/corr = cross_fx(per_coin, names, T, 15)            # cross-sectional
+  regimes  = mkt_regime(per_coin, names, btc_close, T)   # market regime
+  cube     = stack_cube(per_coin, rel, corr, regimes...)  # (T, 15, 14)
 
-> Chi tiết: [stop-loss.md](stop-loss.md)
-
-### F-STOP — Auto-labeling
-- [ ] Sinh target stop_loss_% từ historical drawdown + buffer 20%
-- [ ] Train/val/test split đồng bộ với RL pipeline
-
-### F-STOP — 3 Models
-- [ ] ATR Baseline (rule-based, benchmark)
-- [ ] XGBoost Regressor (feature importance)
-- [ ] Conv1D StopNet (tái sử dụng StateEncoder)
-
-### F-STOP — Integration
-- [ ] Daily pipeline: RL → Stop → Execute
-- [ ] Stop-loss cứng: set 1 lần, check daily close, không trailing
-- [ ] Backtest so sánh with/without stop-loss
+14 features: 7 per-coin + 2 cross + 4 market + 1 weight
+```
