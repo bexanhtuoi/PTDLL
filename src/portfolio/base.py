@@ -123,7 +123,7 @@ def val_params(val_env, cfg):
     val_ep_len = min(val_ep_len, avail - lb)
     val_max_start = max(n - lb - val_ep_len, lb + 1)
     val_rng = np.random.default_rng(cfg.random_state + 999)
-    return val_ep_len, val_max_start, val_rng
+    return cfg.val_n_episodes, val_ep_len, val_max_start, val_rng
 
 
 def build_cube(
@@ -155,7 +155,8 @@ class CryptoPortfolioEnv:
         step_days: int = 63,
         fee_rate: float = 0.001,
         seed: int = 42,
-        lambdas: tuple[float, float, float] = (0.2, 0.25, 0.002),
+        lambdas: tuple[float, float, float, float] = (0.2, 0.25, 0.002, 0.0),
+        reward_style: str = "direct",
     ):
         self.cube = cube.astype(np.float32, copy=False)
         self.asset_names = asset_names
@@ -168,7 +169,8 @@ class CryptoPortfolioEnv:
         self.episode_len = episode_years * 365
         self.step_days = step_days
         self.fee_rate = fee_rate
-        self.lambda_vol, self.lambda_dd, self.lambda_turnover = lambdas
+        self.lambda_vol, self.lambda_dd, self.lambda_turnover, self.lambda_conc = lambdas
+        self.reward_style = reward_style
         self.rng = np.random.default_rng(seed)
         self.n_steps = self.cube.shape[0]
 
@@ -284,11 +286,14 @@ class CryptoPortfolioEnv:
         return ns, reward, done, info
 
     def reward_fn(self, period_return: float, period_vol: float, dd_90: float, turnover: float, bench: dict[str, float]) -> float:
+        conc = -float(np.sum(self.weights ** 2)) * self.lambda_conc
+        if self.reward_style == "direct":
+            return period_return - self.lambda_vol * period_vol - self.lambda_dd * dd_90 - self.lambda_turnover * turnover + conc
         wins = sum([period_return > bench["btc"], period_return > bench["ew"],
                     period_return > bench["mom"], period_return > bench["rp"]])
         rank_score = wins / 4.0
         bear_bonus = min(1.0, -bench["btc"] * 10) if bench["btc"] < -0.02 and period_return > 0 else 0.0
-        return rank_score - self.lambda_vol * period_vol - self.lambda_dd * dd_90 - self.lambda_turnover * turnover + bear_bonus
+        return rank_score - self.lambda_vol * period_vol - self.lambda_dd * dd_90 - self.lambda_turnover * turnover + bear_bonus + conc
 
     def pv_metrics(self) -> dict:
         pv = np.array(self.portfolio_values)
@@ -380,18 +385,48 @@ class BaseModel(ABC):
     def eval_ckpt(
         self, val_env, vp, ep: int, sharpe: float,
         history: list, best_val_sharpe: float, no_improve_count: int,
-        best_path, name_tag: str, cfg, log,
+        best_path, name_tag: str, cfg, log, comb_vp=None, comb_env=None,
     ) -> tuple[float, int, bool]:
-        val_ep_len, val_max_start, val_rng = vp
-        val_start = int(val_rng.integers(val_env.lookback, val_max_start))
-        val_metrics = self.score(val_env, start_idx=val_start, end_idx=val_start + val_ep_len)
-        val_metrics["episode"] = ep + 1
-        val_metrics["train_sharpe"] = sharpe
-        history.append(val_metrics)
+        n_val, val_ep_len, val_max_start, val_rng = vp
+        val_sharpes = []
+        val_returns = []
+        for _ in range(n_val):
+            start = int(val_rng.integers(val_env.lookback, val_max_start))
+            metrics = self.score(val_env, start_idx=start, end_idx=start + val_ep_len)
+            val_sharpes.append(metrics["sharpe"])
+            val_returns.append(metrics["total_return"])
+        val_sharpe_mean = float(np.mean(val_sharpes))
+        val_sharpe_std = float(np.std(val_sharpes))
+        val_return_mean = float(np.mean(val_returns))
+
+        if comb_vp and comb_env:
+            c_n, c_len, c_max, c_rng = comb_vp
+            c_sharpes = []
+            for _ in range(max(c_n, n_val)):
+                start = int(c_rng.integers(comb_env.lookback, c_max))
+                m = self.score(comb_env, start_idx=start, end_idx=start + c_len)
+                c_sharpes.append(m["sharpe"])
+            comb_sharpe = float(np.mean(c_sharpes))
+            score = val_sharpe_mean * 0.3 + comb_sharpe * 0.7
+        else:
+            comb_sharpe = 0.0
+            score = val_sharpe_mean
+
+        entry = {
+            "episode": ep + 1,
+            "train_sharpe": sharpe,
+            "sharpe": val_sharpe_mean,
+            "sharpe_std": val_sharpe_std,
+            "total_return": val_return_mean,
+            "comb_sharpe": comb_sharpe,
+            "score": score,
+            "val_sharpes": val_sharpes,
+        }
+        history.append(entry)
 
         improved = False
-        if val_metrics["sharpe"] > best_val_sharpe:
-            best_val_sharpe = val_metrics["sharpe"]
+        if score > best_val_sharpe:
+            best_val_sharpe = score
             self.save(str(best_path))
             no_improve_count = 0
             improved = True
@@ -401,7 +436,9 @@ class BaseModel(ABC):
         log.write(
             f"Ep {ep+1:5d}: "
             f"Train S={sharpe:.4f} | "
-            f"Val S={val_metrics['sharpe']:.4f} R={val_metrics['total_return']:.4f} "
+            f"Val S={val_sharpe_mean:.4f}±{val_sharpe_std:.4f} "
+            f"R={val_return_mean:.4f} "
+            f"Comb={comb_sharpe:.4f} "
             f"(Best={best_val_sharpe:.4f})"
             f"{' *' if improved else ''}"
         )
@@ -423,10 +460,12 @@ class BaseModel(ABC):
         train_env,
         val_env = None,
         cfg: PipelineConfig | None = None,
+        comb_env = None,
     ) -> list[dict]:
         cfg = cfg or PipelineConfig()
 
         vp = val_params(val_env, cfg)
+        comb_vp = val_params(comb_env, cfg) if comb_env else None
 
         history: list[dict] = []
         best_val_sharpe = -np.inf
@@ -450,6 +489,7 @@ class BaseModel(ABC):
                         val_env, vp, ep, sharpe, history,
                         best_val_sharpe, no_improve_count,
                         best_path, name_tag, cfg, log,
+                        comb_vp=comb_vp, comb_env=comb_env,
                     )
                 if stop:
                     break
@@ -511,7 +551,6 @@ class ValueNet(nn.Module):
             nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, 1),
         )
-
     def forward(self, x):
         b, L, A, F = x.shape
         x = x.view(b, A * F, L)
@@ -549,7 +588,6 @@ class TwinQNet(nn.Module):
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, 1),
         )
-
     def forward(self, state, action):
         feat = self.encoder(state)
         x = torch.cat([feat, action], dim=1)

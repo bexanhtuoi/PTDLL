@@ -5,7 +5,7 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import HISTORY_PATH, MODEL_DIR, PROCESSED_DIR, PipelineConfig
+from config import RISK_HISTORY_PATH, MODEL_DIR, PROCESSED_DIR, PipelineConfig
 from dataset.fetch import load_coin_arrays, COINS_15
 from portfolio.base import build_cube
 from lib.utils import ffill_grid, shared_dates, save_json, load_json, ensure_dirs
@@ -166,8 +166,8 @@ def train(
     test_loss /= len(test_loader.dataset)
     log.write(f"{model_name} done! Test MAE={test_loss:.6f}")
 
-    data_dict = load_json(HISTORY_PATH)
-    data_dict[f"risk_{model_name}"] = {"train": history, "test": {"mae": test_loss}}
-    save_json(data_dict, HISTORY_PATH)
+    data_dict = load_json(RISK_HISTORY_PATH)
+    data_dict[model_name] = {"train": history, "test": {"mae": test_loss}}
+    save_json(data_dict, RISK_HISTORY_PATH)
 
     return model, history

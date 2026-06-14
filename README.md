@@ -1,100 +1,164 @@
-# PTDLL — Crypto Portfolio with RL + Risk Stop-Loss
+# PTDLL — Crypto Portfolio Trading with DRL & Risk ML
 
-Hệ thống 2 tầng: **RL portfolio allocation** (PPO/SAC/TD3) + **ML stop-loss prediction** (ANN/LSTM/CNN) cho 15 crypto coins.
+Hệ thống 2 tầng: **Portfolio RL** (SAC/PPO/TD3) + **Risk ML** (ANN/LSTM/CNN) cho 15 crypto coins.
 
 ## Architecture
 
-```
-portrait.py train --mode parallel --models ppo sac td3    # RL allocate
-risk train {ann|lstm|cnn}                                   # Stop-loss predict
-```
+| Layer | Loại | Models | Input → Output |
+|-------|------|--------|---------------|
+| **Portfolio** | Deep RL | SAC, PPO, TD3 | state cube (60,15,14) → weights (15,) |
+| **Risk** | Supervised | ANN, LSTM, CNN | cube (60,13) + coin_idx → stop_% ∈ [0.05, 0.50] |
 
-| Layer | Loại | Models | Input | Output |
-|-------|------|--------|-------|--------|
-| **Portfolio** | RL | PPO, SAC, TD3 | state cube (60,15,14) | allocation weights (15,) |
-| **Risk** | ML | ANN, LSTM, CNN | (60,13) + coin_idx | stop_% ∈ [0.05, 0.50] |
-
-## Quick start
+## Quick Start
 
 ```powershell
-uv sync
-uv run pytest -v                    # 11 tests
-uv run -m python src.main portfolio train --mode seq  # train RL
-uv run -m python src.main portfolio report             # charts + tables
+$env:PYTHONPATH="src"
+python -m main portfolio train --mode seq --models ppo sac td3
+python -m main portfolio predict --model sac
+python -m main portfolio report
+python -m main risk train --models ann lstm cnn
+python -m main risk predict --model cnn
+python -m main risk report
+python src/gen_report.py              # full report: charts + tables + chart.json
 ```
-
-## 15 coins
-
-BTC, LTC, XRP, DOGE, XMR, DASH, XLM, USDT, ETH, ETC, WAVES, ZEC, DCR, NEO, BNB
-
-## State cube (14 features)
-
-| Feature | Ý nghĩa |
-|---------|---------|
-| return_1d / 7d / 30d / 90d | Rolling returns |
-| volatility | 20-day rolling std |
-| drawdown | close / rolling_max - 1 |
-| volume_change | volume % change |
-| relative_strength_vs_BTC | return_30d vs BTC |
-| correlation_vs_BTC | 60d rolling corr |
-| btc_ma200_position | BTC vs SMA200 |
-| market_volatility | avg vol all coins |
-| btc_momentum_90d | BTC 90d return |
-| market_breadth | % coins positive |
-| weight | injected by env (RL only) |
-
-Risk dùng 13 feature đầu (không weight).
-
-## 3 RL Models
-
-| Model | Paradigm | Key mechanism |
-|-------|----------|--------------|
-| PPO | On-policy | Clipped surrogate, GAE(λ=0.95), K=4 epochs |
-| SAC | Off-policy | Max entropy, auto temperature, twin Q |
-| TD3 | Off-policy | Delayed policy, target smoothing, twin Q |
-
-## 3 Risk Models
-
-| Model | Backbone | Temporal |
-|-------|----------|----------|
-| ANN | MLP | ❌ flatten |
-| LSTM | LSTM(64) | ✅ sequence |
-| CNN | Conv1D×2 + BN | ✅ conv |
-
-Cả 3 dùng Embedding(14, 4) cho coin_id. Loss: asym_mae(over=0.5, under=2.0).
 
 ## Data Split
 
-| Split | Range |
-|-------|-------|
-| Train | 2017-01-01 → 2024-06-01 |
-| Validation | 2024-06-01 → 2025-06-01 |
-| Test | 2025-06-01 → 2026-06-01 |
+| Split | Period | Market |
+|-------|--------|--------|
+| Train | 2017-01-01 → 2024-06-01 | Bull + Bear cycles |
+| Val | 2024-06-01 → 2025-06-01 | Sideways/Bear |
+| Test | 2025-06-01 → 2026-06-01 | Bear (BTC -37%) |
+
+## 15 Coins
+
+BTC, LTC, XRP, DOGE, XMR, DASH, XLM, USDT, ETH, ETC, WAVES, ZEC, DCR, NEO, BNB
+
+## State Cube (14 features)
+
+### Per-coin (7)
+`return_1d`, `return_7d`, `return_30d`, `return_90d`, `volatility` (20d), `drawdown`, `volume_change`
+
+### Cross-coin (2)
+`relative_strength_vs_BTC` (30d return vs BTC), `correlation_vs_BTC` (60d rolling)
+
+### Market regime (4)
+`btc_ma200_position`, `market_volatility`, `btc_momentum_90d`, `market_breadth`
+
+### RL (1)
+`weight` — current portfolio weight (injected by env)
+
+Risk models use first 13 features (excl. weight).
+
+## 3 Portfolio Models
+
+| Model | Paradigm | Best Config |
+|-------|----------|-------------|
+| **SAC** | Off-policy, max entropy | α=100, actor_wd=1e-1, γ=0.95, lr=3e-4 |
+| **PPO** | On-policy, clipped | α=50, actor_wd=1e-1, entropy=0.01, K=10 |
+| **TD3** | Off-policy, delayed | actor_wd=1e-1, noise=0.15, γ=0.95 |
+
+Key insight: **Asymmetric weight_decay** (actor_wd=1e-1, critic_wd=1e-4) forces near-uniform allocation in bear markets (safe), allows differentiation in bull markets.
+
+## 3 Risk Models
+
+| Model | Architecture | Temporal |
+|-------|-------------|----------|
+| ANN | MLP (Linear→64→32→1) + Embedding(14,4) | ❌ |
+| LSTM | LSTM(64, 2-layer) + Embedding | ✅ |
+| CNN | Conv1D×2 (32→64) + BN + Embedding | ✅ |
+
+Loss: `asym_mae` (overestimation penalty 0.5×, underestimation penalty 2.0×)
+
+## Best Results
+
+### Portfolio (Test 2025-2026)
+
+| Model | Multi Sharpe | Pos. Episodes | Single Sharpe | Return |
+|-------|:-----------:|:-------------:|:-------------:|:------:|
+| **SAC** | **+0.21** | 90% | +4.76 | +13.3% |
+| PPO | -0.16 | 18% | +0.18 | -5.0% |
+| TD3 | -0.16 | 20% | +0.23 | -5.0% |
+| Equal Weight | -0.15 | — | -0.15 | -5.0% |
+
+### Risk (Test 2025-2026, 3850 samples)
+
+| Model | Hit Rate | MAE | Pred Stop | Actual Stop |
+|-------|:-------:|:---:|:---------:|:-----------:|
+| ANN | 70% | 0.164 | 0.42 | 0.29 |
+| **LSTM** | **85%** | 0.199 | 0.49 | 0.29 |
+| **CNN** | **84%** | 0.177 | 0.46 | 0.29 |
+| Baseline (mean) | 44% | 0.147 | 0.29 | 0.29 |
+
+## Models (v1)
+
+```
+models/v1/
+├── portfolio/
+│   ├── sac.pt       SAC  (+0.21 multi-ep Sharpe)
+│   ├── ppo.pt       PPO  (-0.16 multi-ep Sharpe)
+│   └── td3.pt       TD3  (-0.16 multi-ep Sharpe)
+└── risk/
+    ├── risk_ann.pt   ANN  (HR=70%)
+    ├── risk_lstm.pt  LSTM (HR=85%)
+    └── risk_cnn.pt   CNN  (HR=84%)
+```
+
+## Report
+
+```powershell
+python src/gen_report.py
+```
+
+Outputs to:
+```
+results/
+├── figures/    (10 numbered PNG charts)
+├── tables/     (LaTeX + JSON tables)
+├── predictions/ (risk_pred_test.csv)
+├── chart.json    (metadata with analyst analysis)
+├── statistic.json (project statistics)
+└── summary.txt   (text summary)
+```
+
+## CLI
+
+```powershell
+python -m main portfolio train  --models sac ppo td3
+python -m main portfolio predict --model sac
+python -m main portfolio report
+
+python -m main risk train  --models ann lstm cnn
+python -m main risk predict --model cnn
+python -m main risk report
+```
 
 ## Project Structure
 
 ```
 src/
-├── config.py              # PipelineConfig (pydantic-settings)
-├── main.py                # CLI: portfolio|risk {train|predict|report}
-├── lib/                   # features.py, metrics.py, plot.py, utils.py
-├── dataset/fetch.py       # 15 coins loader
-├── portfolio/             # env.py, base.py, ppo/sac/td3.py, train.py, evaluate.py
-├── risk/                  # base.py, train.py, evaluate.py, predict.py
-└── report.py              # gen_report (figures, tables, LaTeX)
-
-docs/                      # Architecture docs (Obsidian format)
-  overview.md, features.md, stop-loss.md, rl-metrics.md,
-  workflow.md, tasks.md, results.md
+├── config.py                   # PipelineConfig (pydantic)
+├── main.py                     # CLI entry
+├── gen_report.py               # Full report generator
+├── lib/                        # features, metrics, plot, utils
+├── dataset/fetch.py            # 15 coin OHLCV loader
+├── portfolio/                  # env, base, PPO/SAC/TD3, train, evaluate
+├── risk/                       # base, train, evaluate, predict, report
+├── report.py                   # Portfolio report (legacy)
 ```
 
-## Results
+## Key Parameters
 
-| Model | Val Sharpe | Test Sharpe | Test Return |
-|-------|:----------:|:-----------:|:-----------:|
-| PPO | 1.00 | -0.79 | -54% |
-| SAC | 1.05 | +0.18 | -5% |
-| TD3 | — | — | — |
+| Param | Value | Why |
+|-------|-------|-----|
+| `rebalance_days` | 90 | Smooths noise, 16 steps/ep |
+| `episode_years` | 4 | Sufficient train window |
+| `gamma` | 0.95 | Moderate discount |
+| `lookback` | 60 | 2-month state window |
+| `actor_wd` | 1e-1 | Strong reg → uniform (safe) |
+| `critic_wd` | 1e-4 | Weak reg → better Q values |
+| `alpha_mult` (SAC) | 100 | High exploration |
+| `asym_mae` (risk) | over=0.5, under=2.0 | Penalize underestimation |
 
 ## License
 

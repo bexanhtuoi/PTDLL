@@ -14,11 +14,12 @@ from report import gen_report
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    if args.episodes:
-        cfg = PipelineConfig(n_episodes=args.episodes)
-    else:
-        cfg = PipelineConfig()
-    model_list = [(m, {}) for m in args.models]
+    cfg = PipelineConfig(n_episodes=args.episodes) if args.episodes else PipelineConfig()
+    model_list = []
+    for m in args.models:
+        overrides = {}
+        overrides["reward_style"] = "benchmark"
+        model_list.append((m, overrides))
     parallel = args.mode == "parallel"
     train(models=model_list, parallel=parallel, cfg=cfg)
 
@@ -67,8 +68,8 @@ def portfolio_parser(sub) -> None:
     p_train.add_argument("--mode", choices=["seq", "parallel", "resume"], default="seq")
     p_train.add_argument("--models", nargs="+", default=["ppo", "sac", "td3"],
                          choices=["ppo", "sac", "td3"])
-    p_train.add_argument("--episodes", "-e", type=int, default=1000,
-                         help="Number of training episodes (default: 1000)")
+    p_train.add_argument("--episodes", "-e", type=int, default=0,
+                         help="Number of training episodes (overrides config default)")
     p_train.set_defaults(func=cmd_train)
 
     p_predict = p_sub.add_parser("predict")
@@ -88,11 +89,25 @@ def cmd_risk_train(args: argparse.Namespace) -> None:
 
 
 def cmd_risk_predict(args: argparse.Namespace) -> None:
-    pass
+    from risk.predict import predict_all, make_risk_agent
+
+    model = make_risk_agent(args.model)
+    if model is None:
+        print(f"Model risk_{args.model}.pt not found")
+        return
+
+    cfg = PipelineConfig()
+    out = predict_all(model, cfg, split="test", save_csv=True)
+    df = out["df"]
+    hr = float(df["hit"].mean())
+    mae = float(np.abs(df["pred_stop"] - df["actual_stop"]).mean())
+    print(f"risk_{args.model}: HR={hr:.4f} MAE={mae:.4f} on {len(df)} samples")
 
 
 def cmd_risk_report(args: argparse.Namespace) -> None:
-    pass
+    from risk.report import gen_risk_report
+
+    gen_risk_report()
 
 
 def risk_parser(sub) -> None:

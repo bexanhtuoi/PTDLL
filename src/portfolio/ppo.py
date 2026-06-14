@@ -11,8 +11,9 @@ class PPOAgent(BaseModel):
     def __init__(
         self, lookback: int, n_assets: int, n_features: int = 10,
         lr: float = 3e-4, gamma: float = 0.99, gae_lambda: float = 0.95,
-        clip_epsilon: float = 0.2, entropy_coef: float = 0.01,
+        clip_epsilon: float = 0.2, entropy_coef: float = 0.05,
         k_epochs: int = 4, alpha_mult: float = 5.0, device: str = "cpu",
+        weight_decay: float = 1e-5, actor_wd: float | None = None,
     ):
         self.lookback = lookback
         self.n_assets = n_assets
@@ -24,13 +25,16 @@ class PPOAgent(BaseModel):
         self.entropy_coef = entropy_coef
         self.k_epochs = k_epochs
         self.alpha_mult = alpha_mult
+        self.actor_wd = actor_wd if actor_wd is not None else weight_decay
 
         self.policy = PolicyNet(lookback, n_assets, n_features).to(device)
         self.value = ValueNet(lookback, n_assets, n_features).to(device)
         self.optimizer = optim.Adam(
             list(self.policy.parameters()) + list(self.value.parameters()),
-            lr=lr, weight_decay=1e-5,
+            lr=lr, weight_decay=weight_decay,
         )
+        self.policy_opt = optim.Adam(self.policy.parameters(), lr=lr, weight_decay=self.actor_wd)
+        self.value_opt = optim.Adam(self.value.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.96)
 
     def predict(self, state: np.ndarray) -> np.ndarray:
@@ -96,15 +100,31 @@ class PPOAgent(BaseModel):
         states, actions, advantages, returns, log_probs_old_t = self.unpack_episode(episode)
         total_loss = 0.0
         for _ in range(self.k_epochs):
-            self.optimizer.zero_grad()
-            loss = 0.0
+            policy_loss = 0.0
+            value_loss = 0.0
             for i, s in enumerate(states):
-                loss = loss + self.surrogate_loss(s, actions[i], advantages[i], returns[i], log_probs_old_t[i])
-            loss.backward()
+                state_t = torch.from_numpy(s).unsqueeze(0).to(self.device)
+                action_t = torch.from_numpy(actions[i]).unsqueeze(0).to(self.device)
+                probs = torch.clamp(self.probs(state_t), 1e-6, 1)
+                dist = torch.distributions.Dirichlet(probs * self.alpha_mult + 1)
+                new_log_prob = dist.log_prob(action_t.squeeze(0))
+                entropy = dist.entropy()
+                ratio = torch.exp(new_log_prob - log_probs_old_t[i])
+                ratio = torch.clamp(ratio, 0.01, 100)
+                surr1 = ratio * advantages[i]
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages[i]
+                policy_loss = policy_loss + -torch.min(surr1, surr2) - self.entropy_coef * entropy
+                v_pred = self.value(state_t).squeeze(-1)
+                value_loss = value_loss + 0.5 * (v_pred - returns[i]) ** 2
+            self.policy_opt.zero_grad()
+            policy_loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.policy_opt.step()
+            self.value_opt.zero_grad()
+            value_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-            self.optimizer.step()
-            total_loss += loss.item()
+            self.value_opt.step()
+            total_loss += (policy_loss + value_loss).item()
         self.scheduler.step()
         return total_loss / self.k_epochs
 
@@ -130,12 +150,14 @@ class PPOAgent(BaseModel):
         return {
             "policy": self.policy.state_dict(),
             "value": self.value.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+            "policy_opt": self.policy_opt.state_dict(),
+            "value_opt": self.value_opt.state_dict(),
             "scheduler": self.scheduler.state_dict(),
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.policy.load_state_dict(state_dict["policy"])
         self.value.load_state_dict(state_dict["value"])
-        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self.policy_opt.load_state_dict(state_dict["policy_opt"])
+        self.value_opt.load_state_dict(state_dict["value_opt"])
         self.scheduler.load_state_dict(state_dict["scheduler"])

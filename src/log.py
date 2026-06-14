@@ -45,3 +45,25 @@ def redirect_stdout_to_log(name: str) -> None:
     _stdout_log = get_log(name)
     sys.stdout = _stdout_log  # type: ignore[assignment]
     sys.stderr = _stdout_log
+
+
+class TeeLog:
+    def __init__(self, log: Log, console):
+        self.log = log
+        self.console = console
+
+    def write(self, msg: str) -> None:
+        self.log.write(msg)
+        self.console.write(msg)
+
+    def flush(self) -> None:
+        self.log.flush()
+        self.console.flush()
+
+
+def tee_stdout(name: str) -> None:
+    import sys
+    global _stdout_log
+    _stdout_log = get_log(name)
+    sys.stdout = TeeLog(_stdout_log, sys.stdout)  # type: ignore[assignment]
+    sys.stderr = TeeLog(_stdout_log, sys.stderr)

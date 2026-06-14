@@ -11,9 +11,10 @@ class SACAgent(BaseModel):
     def __init__(
         self, lookback: int, n_assets: int, n_features: int = 10,
         lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005,
-        alpha_mult: float = 15.0, target_entropy: float | None = None,
+        alpha_mult: float = 10.0, target_entropy: float | None = None,
         batch_size: int = 64, replay_capacity: int = 100000,
-        device: str = "cpu",
+        device: str = "cpu", weight_decay: float = 1e-5,
+        actor_wd: float | None = None,
     ):
         self.lookback = lookback
         self.n_assets = n_assets
@@ -23,6 +24,8 @@ class SACAgent(BaseModel):
         self.tau = tau
         self.alpha_mult = alpha_mult
         self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.actor_wd = actor_wd if actor_wd is not None else weight_decay
 
         self.actor = PolicyNet(lookback, n_assets, n_features).to(device)
         self.critic = TwinQNet(lookback, n_assets, n_features).to(device)
@@ -31,8 +34,8 @@ class SACAgent(BaseModel):
         for p in self.target_critic.parameters():
             p.requires_grad = False
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr, weight_decay=1e-5)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr, weight_decay=1e-5)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr, weight_decay=self.actor_wd)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr, weight_decay=weight_decay)
 
         target_entropy = target_entropy if target_entropy is not None else -float(n_assets)
         self.log_alpha = torch.tensor(np.log(0.1), dtype=torch.float32, device=device, requires_grad=True)

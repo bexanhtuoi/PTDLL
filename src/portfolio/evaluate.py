@@ -11,20 +11,21 @@ from log import get_log
 
 
 def make_agent(name: str, env, cfg: PipelineConfig, **overrides) -> BaseModel:
+    overrides.setdefault("lr", cfg.lr)
+    overrides.setdefault("gamma", cfg.gamma)
     kwargs = dict(
         lookback=cfg.lookback,
         n_assets=env.n_assets,
         n_features=env.n_features,
-        lr=overrides.get("lr", cfg.lr),
-        gamma=overrides.get("gamma", cfg.gamma),
         device="cpu",
     )
     if name == "PPO":
-        return PPOAgent(**kwargs, entropy_coef=overrides.get("entropy_coef", cfg.entropy_coef))
+        overrides.setdefault("entropy_coef", cfg.entropy_coef)
+        return PPOAgent(**kwargs, **overrides)
     elif name == "SAC":
-        return SACAgent(**kwargs)
+        return SACAgent(**kwargs, **overrides)
     elif name == "TD3":
-        return TD3Agent(**kwargs)
+        return TD3Agent(**kwargs, **overrides)
     raise ValueError(f"Unknown agent: {name}")
 
 

@@ -12,10 +12,11 @@ class TD3Agent(BaseModel):
         self, lookback: int, n_assets: int, n_features: int = 10,
         lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005,
         policy_noise: float = 0.2, noise_clip: float = 0.4,
-        policy_delay: int = 2, exploration_noise: float = 0.10,
+        policy_delay: int = 2, exploration_noise: float = 0.15,
         entropy_coef: float = 0.2,
         batch_size: int = 64, replay_capacity: int = 100000,
-        device: str = "cpu",
+        device: str = "cpu", weight_decay: float = 1e-5,
+        actor_wd: float | None = None,
     ):
         self.lookback = lookback
         self.n_assets = n_assets
@@ -29,6 +30,8 @@ class TD3Agent(BaseModel):
         self.exploration_noise = exploration_noise
         self.entropy_coef = entropy_coef
         self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.actor_wd = actor_wd if actor_wd is not None else weight_decay
         self.total_steps = 0
 
         self.actor = DeterministicActor(lookback, n_assets, n_features).to(device)
@@ -43,8 +46,8 @@ class TD3Agent(BaseModel):
         for p in self.target_critic.parameters():
             p.requires_grad = False
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr, weight_decay=1e-5)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr, weight_decay=1e-5)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr, weight_decay=self.actor_wd)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr, weight_decay=weight_decay)
 
         self.buffer = ReplayBuffer(replay_capacity)
 
