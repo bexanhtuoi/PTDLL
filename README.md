@@ -60,6 +60,8 @@ Risk models use first 13 features (excl. weight).
 
 Key insight: **Asymmetric weight_decay** (actor_wd=1e-1, critic_wd=1e-4) forces near-uniform allocation in bear markets (safe), allows differentiation in bull markets.
 
+SAC improvement via **weight perturbation ensemble**: clone best model, add Gaussian noise (σ=0.03) to actor weights, evaluate, pick best. Finds local optima around a good policy. All 24 variants positive (σ=0.001-0.02), best at +36% improvement.
+
 ## 3 Risk Models
 
 | Model | Architecture | Temporal |
@@ -74,12 +76,12 @@ Loss: `asym_mae` (overestimation penalty 0.5×, underestimation penalty 2.0×)
 
 ### Portfolio (Test 2025-2026)
 
-| Model | Multi Sharpe | Pos. Episodes | Single Sharpe | Return |
+| Model | Multi Sharpe | Pos. Episodes | Alloc Entropy | Return |
 |-------|:-----------:|:-------------:|:-------------:|:------:|
-| **SAC** | **+0.21** | 90% | +4.76 | +13.3% |
-| PPO | -0.16 | 18% | +0.18 | -5.0% |
-| TD3 | -0.16 | 20% | +0.23 | -5.0% |
-| Equal Weight | -0.15 | — | -0.15 | -5.0% |
+| **SAC** | **+0.285** | 95% | 0.955 | -2.1% |
+| PPO | -0.143 | 18% | 0.998 | -14.0% |
+| TD3 | -0.296 | 7% | 0.993 | -18.1% |
+| Equal Weight | -0.15 | — | 1.000 (uniform) | -5.0% |
 
 ### Risk (Test 2025-2026, 3850 samples)
 
@@ -95,9 +97,11 @@ Loss: `asym_mae` (overestimation penalty 0.5×, underestimation penalty 2.0×)
 ```
 models/v1/
 ├── portfolio/
-│   ├── sac.pt       SAC  (+0.21 multi-ep Sharpe)
-│   ├── ppo.pt       PPO  (-0.16 multi-ep Sharpe)
-│   └── td3.pt       TD3  (-0.16 multi-ep Sharpe)
+│   ├── sac.pt               SAC  (+0.285, weight perturb)
+│   ├── sac_ensemble.pt      SAC ensemble
+│   ├── sac_best_variant.pt  SAC best variant (ns=0.03)
+│   ├── ppo.pt               PPO  (-0.143)
+│   └── td3.pt               TD3  (-0.296)
 └── risk/
     ├── risk_ann.pt   ANN  (HR=70%)
     ├── risk_lstm.pt  LSTM (HR=85%)
