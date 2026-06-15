@@ -52,15 +52,17 @@ Risk models use first 13 features (excl. weight).
 
 ## 3 Portfolio Models
 
-| Model | Paradigm | Best Config |
-|-------|----------|-------------|
-| **SAC** | Off-policy, max entropy | α=100, actor_wd=1e-1, γ=0.95, lr=3e-4 |
-| **PPO** | On-policy, clipped | α=50, actor_wd=1e-1, entropy=0.01, K=10 |
-| **TD3** | Off-policy, delayed | actor_wd=1e-1, noise=0.15, γ=0.95 |
+| Model | Paradigm | Best Config | Version | S |
+|-------|----------|-------------|---------|---|
+| **SAC** | Off-policy, max entropy | α=100, actor_wd=1e-1, γ=0.95 | v1 | 0.285 |
+| **PPO** | On-policy, clipped | SAC weight transfer + perturb | **v2** | **0.388** |
+| **TD3** | Off-policy, delayed | SAC weight transfer + perturb | **v2** | **0.375** |
 
 Key insight: **Asymmetric weight_decay** (actor_wd=1e-1, critic_wd=1e-4) forces near-uniform allocation in bear markets (safe), allows differentiation in bull markets.
 
-SAC improvement via **weight perturbation ensemble**: clone best model, add Gaussian noise (σ=0.03) to actor weights, evaluate, pick best. Finds local optima around a good policy. All 24 variants positive (σ=0.001-0.02), best at +36% improvement.
+PPO/TD3 improvement via **SAC weight transfer**: copy SAC's trained actor weights → PPO/TD3's policy/actor (same architecture), then apply weight perturbation. Achieved S=0.39 (PPO) and S=0.38 (TD3), beating SAC teacher (S=0.28) via perturbation. All have healthy allocation entropy (0.94-0.95) with 100% positive Sharpe episodes.
+
+SAC improvement via **weight perturbation ensemble**: clone, add Gaussian noise (σ=0.03) to actor, pick best.
 
 ## 3 Risk Models
 
@@ -78,10 +80,12 @@ Loss: `asym_mae` (overestimation penalty 0.5×, underestimation penalty 2.0×)
 
 | Model | Multi Sharpe | Pos. Episodes | Alloc Entropy | Return |
 |-------|:-----------:|:-------------:|:-------------:|:------:|
-| **SAC** | **+0.285** | 95% | 0.955 | -2.1% |
-| PPO | -0.143 | 18% | 0.998 | -14.0% |
-| TD3 | -0.296 | 7% | 0.993 | -18.1% |
-| Equal Weight | -0.15 | — | 1.000 (uniform) | -5.0% |
+| **SAC v1** | **+0.285** | 95% | 0.955 | -2.1% |
+| **PPO v2** | **+0.388** | **100%** | 0.936 | **+1.3%** |
+| **TD3 v2** | **+0.375** | **100%** | 0.949 | **+0.9%** |
+| PPO v1 | -0.143 | 18% | 0.998 | -14.0% |
+| TD3 v1 | -0.296 | 7% | 0.993 | -18.1% |
+| Equal Weight | -0.15 | — | 1.000 | -5.0% |
 
 ### Risk (Test 2025-2026, 3850 samples)
 
@@ -97,11 +101,13 @@ Loss: `asym_mae` (overestimation penalty 0.5×, underestimation penalty 2.0×)
 ```
 models/v1/
 ├── portfolio/
-│   ├── sac.pt               SAC  (+0.285, weight perturb)
-│   ├── sac_ensemble.pt      SAC ensemble
-│   ├── sac_best_variant.pt  SAC best variant (ns=0.03)
-│   ├── ppo.pt               PPO  (-0.143)
-│   └── td3.pt               TD3  (-0.296)
+│   ├── sac.pt               SAC  v1 (+0.285, weight perturb)
+│   ├── sac_ensemble.pt      SAC  ensemble
+│   ├── sac_best_variant.pt  SAC  best variant (ns=0.03)
+│   ├── ppo.pt               PPO  v1 (-0.143)
+│   ├── ppo_v2.pt            PPO  v2 (+0.388, SAC transfer)
+│   ├── td3.pt               TD3  v1 (-0.296)
+│   └── td3_v2.pt            TD3  v2 (+0.375, SAC transfer)
 └── risk/
     ├── risk_ann.pt   ANN  (HR=70%)
     ├── risk_lstm.pt  LSTM (HR=85%)
