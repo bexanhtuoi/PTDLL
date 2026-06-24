@@ -16,6 +16,7 @@ HISTORY_PATH = ROOT / "results" / "portfolio_history.json"
 RISK_HISTORY_PATH = ROOT / "results" / "risk_history.json"
 
 MODEL_TAGS: dict[str, str] = {"ppo": "PPO", "sac": "SAC", "td3": "TD3"}
+MODEL_TAGS_V2: dict[str, str] = {"sac": "SAC_v1", "ppo": "PPO_v2", "td3": "TD3_v2"}
 
 
 class PipelineConfig(BaseSettings, frozen=True):

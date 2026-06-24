@@ -10,8 +10,23 @@ from portfolio.base import build_cube
 from lib.utils import ffill_grid, shared_dates, ensure_dirs
 from config import PREDICTIONS_DIR
 
-from risk.base import LOOKBACK, N_FEATURES, BaseStopModel
-from risk.train import LABEL_WINDOW, MODEL_NAMES
+from risk.base import LOOKBACK, STOP_MIN, STOP_MAX, STOP_RANGE, BaseStopModel, FeatureScaler, N_COINS, EnsembleLSTM
+from risk.train import LABEL_WINDOW, MODEL_NAMES, SCALER_PATH
+
+
+def _load_scaler():
+    import os
+    scaler = FeatureScaler()
+    scaler.z_mean = None
+    scaler.z_std = None
+    if os.path.exists(SCALER_PATH):
+        d = np.load(SCALER_PATH)
+        scaler.mean = d["mean"]
+        scaler.std = d["std"]
+        scaler.dead = d.get("dead") if "dead" in d else None
+        scaler.z_mean = d.get("z_mean")
+        scaler.z_std = d.get("z_std")
+    return scaler
 
 
 def predict_all(
@@ -24,6 +39,8 @@ def predict_all(
     cfg = cfg or PipelineConfig()
     out_dir = out_dir or PREDICTIONS_DIR
     ensure_dirs(out_dir)
+
+    scaler = _load_scaler()
 
     coin_arrays = load_coin_arrays()
     usdt_short = COINS_15[7].replace("-USD", "")
@@ -51,19 +68,43 @@ def predict_all(
     ps = np.datetime64(period_start)
     pe = np.datetime64(period_end)
 
+    # Precompute extra features for all (t, coin)
+    from lib.features import rsi, rolling_skew, rolling_down_ratio, rolling_mean
+    T_full = cube.shape[0]
+    n_assets = len(shorts)
+    extra_cube = np.zeros((T_full, n_assets, 4), dtype=np.float32)
+    for i in range(n_assets):
+        c = close_grid[:, i]
+        dr = np.diff(c, prepend=c[0]) / (c + 1e-12)
+        dr[0] = 0.0
+        extra_cube[:, i, 0] = rsi(c).ravel()
+        extra_cube[:, i, 1] = rolling_skew(dr, 60)
+        extra_cube[:, i, 2] = rolling_down_ratio(dr, 60)
+        sma200 = rolling_mean(c, 200)
+        extra_cube[:, i, 3] = (c - sma200) / (sma200 + 1e-12)
+    extra_cube[np.isnan(extra_cube)] = 0.0
+    N_CUBE = 13
+
     rows = []
     for t in range(LOOKBACK, T - LABEL_WINDOW):
         if date_index[t] < ps or date_index[t] >= pe:
             continue
         for old_i in risk_indices:
-            x = cube[t - LOOKBACK:t, old_i, :N_FEATURES]
-            if np.any(np.isnan(x)):
-                continue
-            x_clean = np.nan_to_num(x, 0).astype(np.float32)
+            x = cube[t - LOOKBACK:t, old_i, :N_CUBE].copy()
+            x[np.isnan(x)] = 0.0
+            extra = extra_cube[t - LOOKBACK:t, old_i, :].copy()
+            x = np.concatenate([x[:, :7], extra, x[:, 7:]], axis=1)
+            if scaler.mean is not None:
+                x = scaler.transform(x[np.newaxis, :, :])[0]
             coin_idx = old_to_risk[old_i]
-            pred = float(model.predict(x_clean[np.newaxis, :, :], np.array([coin_idx]))[0])
+            pred_z = float(model.predict(x[np.newaxis, :, :], np.array([coin_idx]))[0])
+            if scaler.z_mean is not None and scaler.z_std is not None:
+                pred = pred_z * float(scaler.z_std[coin_idx]) + float(scaler.z_mean[coin_idx])
+            else:
+                pred = pred_z
+            pred = float(np.clip(pred, STOP_MIN, STOP_MAX))
             close_val = float(close_grid[t, old_i])
-            future_slice = close_grid[t:min(t + 90, T), old_i]
+            future_slice = close_grid[t:min(t + LABEL_WINDOW, T), old_i]
             if len(future_slice) < 2:
                 continue
             low = float(future_slice.min())
@@ -88,13 +129,32 @@ def predict_all(
 
 
 def make_risk_agent(model_name: str, env=None) -> BaseStopModel | None:
+    # Use ensemble for LSTM
+    ens_dir = MODEL_DIR / "v2" / "risk" / "lstm_ensemble"
+    if model_name == "lstm" and ens_dir.exists():
+        n_models = len(list(ens_dir.glob("model_*.pt")))
+        if n_models > 1:
+            try:
+                model = EnsembleLSTM(ens_dir, n_models)
+                return model
+            except RuntimeError as e:
+                print(f"  lstm ensemble: load failed ({e})")
+
     model_cls = MODEL_NAMES.get(model_name)
     if model_cls is None:
         return None
-    path = MODEL_DIR / f"risk_{model_name}.pt"
-    if not path.exists():
-        print(f"No saved model at {path}")
-        return None
-    model = model_cls()
-    model.load(str(path))
-    return model
+    for p in [
+        MODEL_DIR / "v2" / "risk" / f"risk_{model_name}.pt",
+        MODEL_DIR / f"risk_{model_name}.pt",
+        MODEL_DIR / "v1" / "risk" / f"risk_{model_name}.pt",
+    ]:
+        if p.exists():
+            try:
+                model = model_cls()
+                model.load(str(p))
+                return model
+            except RuntimeError as e:
+                print(f"  {model_name}: checkpoint mismatch ({e})")
+                continue
+    print(f"No compatible saved model for {model_name}")
+    return None

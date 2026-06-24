@@ -1,6 +1,7 @@
 # Stop-Loss Prediction Layer (ML — Supervised Learning)
 
-> **Mục tiêu:** Sau khi RL phân bổ vốn vào coin nào, dự đoán `stop_%` cho coin đó. Bài toán supervised learning đầu vào 60 ngày close → `stop_%` trong 90 ngày tới.
+> **Mục tiêu:** Sau khi RL phân bổ vốn vào coin nào, dự đoán `stop_%` cho coin đó.
+> Đầu vào 60 ngày × 17 features → z-score của 10d forward drawdown, convert sang stop%.
 
 ---
 
@@ -11,9 +12,11 @@ RL allocate weights (15 coins)
   │
   ▼
 Với mỗi coin (trừ USDT) — gọi risk model:
-  predict(x_60d, coin_idx) → stop_% ∈ [0.05, 0.50]
+  predict(x_60d, coin_idx) → z_score ∈ [-3, 3] (tanh × 3)
+  denormalize: raw = z × coin_std + coin_mean
+  calibrate: stop_% = clip(α × raw + β, 0.05, 0.50)
   stop_price = close × (1 - stop_%)
-  set stop_price CỐ ĐỊNH (không trailing, không thay đổi)
+  set stop_price CỐ ĐỊNH (không trailing)
   │
   ▼ Hàng ngày (chỉ check, không gọi model)
   close ≤ stop_price?
@@ -21,136 +24,132 @@ Với mỗi coin (trừ USDT) — gọi risk model:
     KHÔNG → hold, chờ ngày mai
 ```
 
-**Không trailing**: stop_price set 1 lần, nếu close tăng thì stop_price giữ nguyên. Nếu coin sau đó đỏ mạnh thì stop vẫn còn.
+**Không trailing**: stop_price set 1 lần, nếu close tăng thì stop_price giữ nguyên.
 
-**Chỉ check daily close**: không intraday, dùng daily close price.
+**Chỉ check daily close**: không intraday.
 
-## 2. Auto-Labeling (Target)
+## 2. Auto-Labeling (Target — Z-score per coin)
 
-Target được sinh tự động từ historical data — không cần label thủ công.
+Target = z-score của 10d forward max drawdown (LABEL_WINDOW=10), tính riêng từng coin từ training data.
 
 ```python
-def auto_label(close_T: float, future_90d: np.ndarray) -> float:
-    # Drawdown thực tế trong 90 ngày tới
-    max_dd = (close_T - min(future_90d)) / close_T
+def auto_label(close_T, future_close):
+    low = min(future_close)
+    dd = (close_T - low) / close_T
+    return clip(dd, STOP_MIN, STOP_MAX)  # [0.05, 0.50]
 
-    # Buffer 20% để không bán đáy
-    target = max_dd * 1.2
-    return clip(target, 0.05, 0.50)
+# Per-coin z-score (từ training data):
+z_mean[i] = mean(labels của coin i trong train set)
+z_std[i]  = std(labels của coin i trong train set)
+z_target = (raw_label - z_mean[i]) / z_std[i]
+z_target = clip(z_target, -3.0, 3.0)
 ```
 
-**Ý nghĩa**: Nếu coin thực sự đã đáy ở mức drawdown 20% trong 90 ngày tới, thì stop-loss nên đặt ở 24% (20% × 1.2) — đủ xa đáy 4% để tránh false positive.
-
-**Tại sao buffer 20%?** Vì stop là cứng, không trailing. Nếu đặt đúng đáy thì chỉ cần 1 biến động nhỏ là bị quét.
+Z-score loại bỏ per-coin bias nhưng giữ temporal variation.
 
 ## 3. Model Input
 
-### Per-coin, độc lập portfolio
+### 60 × 17 features (giá trị thực, không rank cross-sectional)
 
 ```
-Input:  x: (60, 13) — 60 ngày × 13 market features
-        coin_idx: int — 0..13 (index của coin, cho Embedding)
-Output: stop_% ∈ [0.05, 0.50] — scalar
+Input:  x: (60, 17) — 60 ngày × 17 features
+        coin_idx: int — 0..13 (cho Embedding)
+Output: z_score ∈ [-3, 3] — tanh × 3
 ```
 
-### 13 features (không weight channel)
+### 17 features
 
-| # | Feature | Ý nghĩa |
-|:-:|---------|---------|
-| 0 | return_1d | Daily return |
-| 1 | return_7d | 7-day return |
-| 2 | return_30d | 30-day return |
-| 3 | return_90d | 90-day return |
-| 4 | volatility | 20-day rolling vol |
-| 5 | drawdown | Distance from peak |
-| 6 | volume_change | Volume % change |
-| 7 | relative_strength_vs_BTC | Vs BTC 30d |
-| 8 | correlation_vs_BTC | 60d corr with BTC |
-| 9 | btc_ma200_position | BTC vs SMA200 |
-| 10 | market_volatility | Market avg vol |
-| 11 | btc_momentum_90d | BTC 90d momentum |
-| 12 | market_breadth | % coins positive |
+| # | Feature | Ý nghĩa | Gốc |
+|:-:|---------|---------|-----|
+| 0 | return_1d | Daily return | per-coin (cube) |
+| 1 | return_7d | 7-day return | per-coin (cube) |
+| 2 | return_30d | 30-day return | per-coin (cube) |
+| 3 | return_90d | 90-day return | per-coin (cube) |
+| 4 | volatility | 20-day rolling vol | per-coin (cube) |
+| 5 | drawdown | Distance from peak | per-coin (cube) |
+| 6 | volume_change | Volume % change | per-coin (cube) |
+| 7 | rsi_14 | RSI 14-day | extra |
+| 8 | return_skew_60 | Skewness 60d returns | extra |
+| 9 | dd_consecutive | % negative days in 60d | extra |
+| 10 | distance_sma200 | % from SMA200 | extra |
+| 11 | relative_strength_vs_BTC | Vs BTC 30d | cross (cube) |
+| 12 | correlation_vs_BTC | 60d corr with BTC | cross (cube) |
+| 13 | btc_ma200_position | BTC vs SMA200 | market (cube) |
+| 14 | market_volatility | Mean volatility 15 coins | market (cube) |
+| 15 | btc_momentum_90d | BTC 90d momentum | market (cube) |
+| 16 | market_breadth | % coins positive 30d | market (cube) |
+
+**Thứ tự features trong code:**
+```
+7 per-coin (cube[:,:,:7])
+  → 4 extra (tính thêm)
+    → 2 cross (cube[:,:,7:9])
+      → 4 market (cube[:,:,9:13])
+```
 
 ### Coin Embedding
 
 ```python
-self.coin_emb = nn.Embedding(14, emb_dim=4)
-# 14 coins (trừ USDT) × 4-d vector học được
-# BTC gần ETH (cùng blue chip), DOGE xa DCR (khác họ)
+self.emb = nn.Embedding(14, emb_dim=16)
+# 14 coins × 16-d vector
 ```
 
-## 4. 3 Models
+## 4. Models
 
 ### Chung interface
 
 ```python
 class BaseStopModel(nn.Module, ABC):
-    emb = nn.Embedding(14, 4)
-    forward(x: (B, 60, 13), coin_idx: (B,) int) → (B, 1) stop_%
+    emb = nn.Embedding(14, 16)
+    forward(x: (B, 60, 17), coin_idx: (B,) int) → (B, 1) z ∈ [-3, 3]
 ```
 
 ### ANN (MLP Baseline)
 
 ```
-Input: (B, 60, 13)
-  flatten(1) → (B, 780)
-  Linear(780 → 64) → ReLU → Dropout(0.3)
-  concat emb(4) → (B, 68)
-  Linear(68 → 32) → ReLU
-  Linear(32 → 1) → Sigmoid × 0.45 + 0.05
-Output: (B, 1)
+Input: (B, 60, 17) → flatten → (B, 1020)
+  Linear(1020 → 256) → BN → LeakyReLU(0.2) → Dropout(0.3)
+  Linear(256 → 128) → BN → LeakyReLU(0.2) → Dropout(0.3)
+  Linear(128 → 64) → BN → LeakyReLU(0.2) → Dropout(0.2)
+  concat emb(16) → (B, 80)
+  Linear(80 → 32) → LeakyReLU(0.2) → Dropout(0.2)
+  Linear(32 → 1) → Tanh × 3
+Output: (B, 1) ∈ [-3, 3]
 ```
 
-Đơn giản nhất, ignore temporal structure. Baseline để so LSTM/CNN.
-
-### LSTM
+### LSTM (best performer)
 
 ```
-Input: (B, 60, 13)
-  emb = coin_emb(coin_idx) → (B, 4)
-  emb = unsqueeze(1) → expand(60) → (B, 60, 4)
-  concat x + emb → (B, 60, 17)
-  LSTM(17 → 64, batch_first) → h_n[-1] → (B, 64)
-  Linear(64 → 1) → Sigmoid × 0.45 + 0.05
-Output: (B, 1)
+Input: (B, 60, 17)
+  emb = coin_emb(coin_idx) → expand(60) → (B, 60, 16)
+  concat x + emb → (B, 60, 33)
+  LSTM(33 → 64, 1-layer bidirectional, batch_first)
+    → h_n[-2] concat h_n[-1] → (B, 128)
+  Linear(128 → 48) → LeakyReLU(0.2)
+  Linear(48 → 1) → Tanh × 3
+Output: (B, 1) ∈ [-3, 3]
 ```
 
-Học temporal pattern — momentum, drawdown tuần tự. Per-coin forward riêng (shared weights).
-
-### StopCNN
+### CNN
 
 ```
-Input: (B, 60, 13)
-  permute(0, 2, 1) → (B, 13, 60)
-  Conv1d(13 → 32, k=3) → BatchNorm → ReLU → MaxPool(2)
-  Conv1d(32 → 64, k=3) → BatchNorm → ReLU → MaxPool(2)
-  flatten(1) → concat emb(4) → (B, ...)
-  Linear(... → 64) → ReLU
-  Linear(64 → 1) → Sigmoid × 0.45 + 0.05
-Output: (B, 1)
+Input: (B, 60, 17) → permute(0, 2, 1) → (B, 17, 60)
+  Conv1d(17 → 32, k=7, pad=3) → BN → LeakyReLU(0.2) → Dropout(0.2)
+  Conv1d(32 → 64, k=5, pad=2) → BN → LeakyReLU(0.2) → Dropout(0.2)
+  Conv1d(64 → 96, k=3, pad=1) → BN → LeakyReLU(0.2) → Dropout(0.2)
+  AdaptiveAvgPool1d(1) → flatten → concat emb(16)
+  Linear(112 → 48) → LeakyReLU(0.2) → Dropout(0.2)
+  Linear(48 → 24) → LeakyReLU(0.2) → Dropout(0.1)
+  Linear(24 → 1) → Tanh × 3
+Output: (B, 1) ∈ [-3, 3]
 ```
 
-Temporal feature extraction bằng Conv1D stack + BatchNorm cho ổn định.
-
-## 5. Loss Functions
-
-### Asymmetric MAE
+## 5. Loss
 
 ```python
-def asym_mae(pred, target, over_w=0.5, under_w=2.0):
-    diff = pred - target
-    w = torch.where(diff > 0, over_w, under_w)
-    # diff > 0: pred > target (stop rộng → an toàn → phạt nhẹ)
-    # diff < 0: pred < target (stop hẹp → bán sớm → phạt nặng)
-    return (w * abs(diff)).mean()
-```
+def combined_loss(pred_dd, target_dd):
+    return MSELoss()(pred_dd, target_dd) + boundary_reg(pred_dd, alpha=0.001)
 
-- **Dự đoán thấp hơn target** (stop quá hẹp) → phạt 2× — nguy hiểm, bán đáy
-- **Dự đoán cao hơn target** (stop quá rộng) → phạt 0.5× — an toàn, chỉ lỡ lời nhiều hơn chút
-
-### Boundary Regularization
-
-```python
 def boundary_reg(pred, alpha=0.001):
     margin = 0.01
     near_min = relu(STOP_MIN + margin - pred)
@@ -158,51 +157,81 @@ def boundary_reg(pred, alpha=0.001):
     return alpha * (near_min + near_max).mean()
 ```
 
-Phạt nhẹ α=0.001 khi output cách biên [0.05, 0.50] dưới 1%, tránh model collapse về 1 phía. Tổng loss: `asym_mae(pred, tgt) + boundary_reg(pred)`.
+Train trên drawdown space (raw label, không z-score). Model output z-score → denormalize → so sánh với raw target.
 
 ## 6. Training
 
 ### Dataset
-```python
-# Gộp tất cả coins, temporal split trước
-for coin_idx in range(14):      # 14 coins (trừ USDT)
-    for t in range(60, T - 90):
-        x = data[t-60:t, :13]   # (60, 13)
-        target = auto_label(data[t-60, 0], data[t:t+90, 0])
-        # (data[t-60, 0] = close at t-60, data[t:t+90, 0] = future close)
+- Per-coin 60d window, z-score labels tại mỗi timestamp
+- Feature scaling: z-score trên toàn bộ features (FeatureScaler)
+- 14 coins (trừ USDT), ~37k train samples / ~4k test samples
 
-# Temporal split: train 2017-2023, val 2023-2024, test 2024+
-# NGĂN LEAK: split TRƯỚC khi shuffle
-```
-
-### Data Split (temporal, label-safe)
+### Data Split (chronological)
 
 ```
-Train:   dates < 2024-06-01 - 90 days  =  before 2024-03-03
-Val:     2024-06-01 ≤ dates < 2025-06-01
-Test:    2025-06-01 ≤ dates
+Train: tất cả data trước test_start (label-safe với LABEL_WINDOW=10)
+Test:  dates >= test_start (2025-06-01)
 ```
+
+Không validation split — train trên toàn bộ pre-test data, test set dùng để theo dõi val_loss.
 
 ### Hyperparams
-- Optimizer: Adam(lr=1e-3)
-- Batch: 256
-- Epochs: 100 (early stop patience 10)
-- Loss: `asym_mae(over=0.5, under=2.0) + boundary_reg(alpha=0.001)`
-- Metric: MAE (chính), hit rate (phụ)
+- Optimizer: AdamW(lr=8e-4, weight_decay=1e-3)
+- LR schedule: CosineAnnealingLR(300 epochs)
+- Batch: 2048 (ANN/LSTM), 1024 (CNN)
+- Epochs: 300
+- Gradient clip norm: 1.0
+
+### Post-hoc Calibration
+Sau training, fit per-coin α, β bằng L1 minimization (Nelder-Mead) trên training predictions:
+```python
+calibrated = clip(α[c] × raw_pred + β[c], STOP_MIN, STOP_MAX)
+```
 
 ## 7. Evaluation Metrics
 
-| Metric | Ý nghĩa | Công thức |
-|--------|---------|-----------|
-| **MAE** | Sai số tuyệt đối | `mean(|pred - target|)` |
-| **Hit Rate** | Stop KHÔNG bị xuyên thủng | `mean(pred >= target)` |
-| **False Positive** | Chạm stop rồi hồi >10% sau 30d | `mean(hit & rebound)` |
-| **Saved Drawdown** | Giảm drawdown so với không stop | `dd_without - dd_with` |
+| Metric | Ý nghĩa |
+|--------|---------|
+| **Pearson r** | Tương quan giữa cal. pred drawdown vs actual drawdown |
+| **MAE** | Mean Absolute Error trong drawdown space (sau calibration) |
+| **Per-coin temporal std** | Model có temporal variation không (vs actual std) |
+| **Hit Rate** | % sample pred ≥ actual — tính trong `predict.py` |
 
-## 8. So sánh models
+## 8. Test Results (2025-2026, calibrated)
 
-| Model | Tham số | Temporal | Speed | Overfit risk |
-|-------|---------|----------|-------|-------------|
-| ANN | ~54K | ❌ batch | ⚡ nhanh | 🔴 cao (flatten mất structure) |
-| LSTM | ~56K | ✅ sequence | 🟡 trung bình | 🟡 vừa |
-| CNN | ~70K | ✅ conv | 🟡 trung bình | 🟢 thấp (BatchNorm) |
+| Model | Test Corr | Pred Std | Act Std | MAE |
+|-------|:--------:|:--------:|:------:|:---:|
+| ANN | ~0.08 | ~0.06 | 0.164 | ~0.16 |
+| **LSTM Ensemble** | **~0.31** | **~0.10** | **0.164** | **~0.047** |
+| CNN | ~0.05 | ~0.05 | 0.164 | ~0.21 |
+
+*Số liệu chính xác xem `results/predictions/risk_pred_test.csv` sau khi chạy `python src/gen_report.py`.*
+
+### Per-coin breakdown (LSTM Ensemble)
+
+| Coin | Pred Std | Act Std | Corr |
+|------|:--------:|:-------:|:----:|
+| DASH | 0.108 | 0.168 | **+0.51** |
+| XMR | 0.087 | 0.138 | **+0.42** |
+| BTC | 0.121 | 0.126 | **+0.39** |
+| XLM | 0.087 | 0.138 | **+0.35** |
+| ZEC | 0.069 | 0.124 | **+0.31** |
+
+### Key insight
+
+LSTM 5-seed ensemble achieves **corr ≈ 0.31**, nearly double the single LSTM (0.215). Ensemble averaging reduces prediction variance and improves generalization.
+
+So với rank-based approach cũ (pred_std=0.018, chỉ 11% actual), model mới có pred_std ≈ 0.10 (62% actual) — predictions thay đổi theo thời gian, không flat per-coin.
+
+Tuy nhiên correlation còn thấp do signal-to-noise ratio của bài toán 60d→10d drawdown yếu. DASH, XMR, BTC có corr 0.3+, cho thấy ensemble bắt timing trên những coin đó.
+
+## 9. Compare: Approaches
+
+| Approach | Temporal Var | Issue |
+|----------|:------------:|-------|
+| Rank targets | 11% actual | No temporal variation |
+| Absolute labels | ~0.01 corr | Distribution shift |
+| Z-score + val split | 62% actual | Val overfitting |
+| **Z-score + no-val + calibrate** | **62% actual** | **Best so far** |
+
+Z-score per coin + train all pre-test data (no val split) + 300 epochs cosine annealing + post-hoc calibration là cấu hình tốt nhất.

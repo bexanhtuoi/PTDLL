@@ -23,7 +23,8 @@ COIN_FEATURE_NAMES = [
 def coin_fx(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
     T = len(close)
     daily_ret = pct_change(close, 1)
-    out = np.zeros((T, 7))
+    daily_ret[0] = 0.0
+    out = np.zeros((T, len(COIN_FEATURE_NAMES)))
     out[:, 0] = daily_ret
     out[:, 1] = pct_change(close, 7)
     out[:, 2] = pct_change(close, 30)
